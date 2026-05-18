@@ -1,0 +1,2 @@
+class ResultService:
+    pass

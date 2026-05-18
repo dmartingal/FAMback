@@ -1,0 +1,1 @@
+-- Placeholder local. Sustituir con el script SQL oficial v3 del catálogo y esquema.
