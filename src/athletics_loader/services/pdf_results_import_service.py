@@ -16,6 +16,7 @@ from athletics_loader.db.models import (
     Competition,
     CompetitionEvent,
     EventType,
+    EventTypeAlias,
     ImportError,
     Result,
     ResultAttempt,
@@ -30,7 +31,11 @@ from athletics_loader.utils.text import normalize_name
 
 
 class PdfResultsImportService:
+    def __init__(self) -> None:
+        self._missing_event_type_aliases: set[tuple[str, str]] = set()
+
     def import_dir(self, pdf_dir: Path) -> list[dict]:
+        self._missing_event_type_aliases.clear()
         parser = FamResultsParser()
         out = []
         for pdf_path in sorted(pdf_dir.glob("*.pdf")):
@@ -283,6 +288,8 @@ class PdfResultsImportService:
             )
             db.add(competition_event)
             db.flush()
+        elif competition_event.event_type_id is None and event_type_id is not None:
+            competition_event.event_type_id = event_type_id
         return competition_event
 
     def _get_or_create_result(
@@ -365,8 +372,30 @@ class PdfResultsImportService:
     def _find_event_type_id(self, db: Session, event_name: str | None) -> int | None:
         if not event_name:
             return None
-        row = db.scalar(select(EventType).where(EventType.name_normalized == _db_normalized(event_name)))
-        return row.id if row else None
+        event_name_normalized = _db_normalized(event_name)
+        row = db.scalar(select(EventType).where(EventType.name_normalized == event_name_normalized))
+        if row:
+            return row.id
+
+        alias = db.scalar(
+            select(EventTypeAlias).where(EventTypeAlias.alias_normalized == event_name_normalized)
+        )
+        if alias:
+            return alias.event_type_id
+
+        self._warn_missing_event_type_alias(event_name, event_name_normalized or "")
+        return None
+
+    def _warn_missing_event_type_alias(self, event_name: str, event_name_normalized: str) -> None:
+        key = (event_name, event_name_normalized)
+        if key in self._missing_event_type_aliases:
+            return
+        self._missing_event_type_aliases.add(key)
+        print(
+            "[WARN] Alias de prueba no encontrado: "
+            f"event_name={event_name!r}, alias_normalized={event_name_normalized!r}. "
+            "Alta este alias en event_type_aliases para rellenar competition_events.event_type_id."
+        )
 
     def _add_import_error(
         self,

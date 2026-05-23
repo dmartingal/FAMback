@@ -25,6 +25,14 @@ class EventType(Base):
     name_normalized: Mapped[str] = mapped_column(String(150), nullable=False)
 
 
+class EventTypeAlias(Base):
+    __tablename__ = "event_type_aliases"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    event_type_id: Mapped[int] = mapped_column(ForeignKey("event_types.id"), nullable=False)
+    alias: Mapped[str] = mapped_column(String(150), nullable=False)
+    alias_normalized: Mapped[str] = mapped_column(String(150), nullable=False)
+
+
 class SourceFile(Base):
     __tablename__ = "source_files"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
