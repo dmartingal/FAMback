@@ -15,3 +15,5 @@ def test_category_from_birth_date() -> None:
 def test_normalize_category_alias() -> None:
     assert normalize_category_alias("Inf") == "SUB-14"
     assert normalize_category_alias("Sub 18") == "SUB-18"
+    assert normalize_category_alias("Master") == "MASTER"
+    assert normalize_category_alias("M\u00e1ster 35") == "MASTER"

@@ -116,7 +116,7 @@ class Result(Base):
     __tablename__ = "results"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     competition_event_id: Mapped[int] = mapped_column(ForeignKey("competition_events.id"), nullable=False)
-    athlete_id: Mapped[int] = mapped_column(ForeignKey("athletes.id"), nullable=False)
+    athlete_id: Mapped[int | None] = mapped_column(ForeignKey("athletes.id"), nullable=True)
     club_id: Mapped[int | None] = mapped_column(ForeignKey("clubs.id"), nullable=True)
     bib_number: Mapped[str | None] = mapped_column(String(30), nullable=True)
     position: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -142,6 +142,20 @@ class ResultAttempt(Base):
     attempt_value_numeric: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)
     attempt_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
     height_or_distance: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)
+    raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class RelayResultMember(Base):
+    __tablename__ = "relay_result_members"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    result_id: Mapped[int | None] = mapped_column(ForeignKey("results.id"), nullable=True)
+    competition_event_id: Mapped[int] = mapped_column(ForeignKey("competition_events.id"), nullable=False)
+    source_file_id: Mapped[int | None] = mapped_column(ForeignKey("source_files.id"), nullable=True)
+    member_order: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    bib_number: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    athlete_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    birth_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    license: Mapped[str | None] = mapped_column(String(100), nullable=True)
     raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 

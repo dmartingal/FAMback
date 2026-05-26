@@ -20,7 +20,7 @@ ACTA_ROUND = re.compile(
 )
 SEX = re.compile(r"\b(?P<sex>Femenino|Masculino|Fem|Masc)\b", re.IGNORECASE)
 TEXT_CATEGORY = re.compile(
-    r"\b(?P<category>Sub\s*\d{1,2}|Abs|Infantil|Inf|Cadete|Cad|Juvenil|Juv|Junior|Promesa|Absolut[ao]|Senior)\b",
+    "\\b(?P<category>Sub\\s*\\d{1,2}|M[a\\u00e1]ster(?:\\s*-?\\s*\\d{2,3})?|Abs|Infantil|Inf|Cadete|Cad|Juvenil|Juv|Junior|Promesa|Absolut[ao]|Senior)\\b",
     re.IGNORECASE,
 )
 SPANISH_DATE_LINE = re.compile(
@@ -35,6 +35,9 @@ STATUS_MAP = {
     "DNF": "DNF",
     "DQ": "DQ",
 }
+
+RELAY_EVENT_NAME = re.compile(r"^\d+x\d+m?$", re.IGNORECASE)
+RELAY_MARK = re.compile(r"^(?:\d{1,2}:\d{2}(?:[.,]\d+)?|\d{1,2}[.,]\d+)-?$")
 
 SPANISH_MONTHS = {
     "ene": 1,
@@ -137,6 +140,7 @@ class FamResultsParser(BasePdfParser):
                     "name": date_match.group("name"),
                     "consumed": 2,
                 }
+
         return None
 
     def _find_next_fam_header(self, lines: list[dict], start: int) -> int:
@@ -182,8 +186,10 @@ class FamResultsParser(BasePdfParser):
                     data_start = index + 1
                 break
 
+        event["has_rt_column"] = _has_rt_column(table_header) or _has_rt_column(detail_header)
         event["attempt_headers"] = self._parse_attempt_headers(table_header, detail_header)
         event["event_type"] = self._detect_event_type(event["event_name"], event["attempt_headers"])
+        event["table_header"] = table_header
         event["results"], event["unparsed_lines"] = self._parse_fam_rows(
             block[data_start:],
             event,
@@ -194,9 +200,14 @@ class FamResultsParser(BasePdfParser):
     def _parse_fam_rows(self, lines: list[dict], event: dict, tail_mode: str | None) -> tuple[list[dict], list[str]]:
         results = []
         unparsed = []
+        relay_members = event.setdefault("relay_members", [])
+        relay_group = None
+        relay_group_counter = 0
         index = 0
         while index < len(lines):
             line = lines[index]["text"]
+            if _is_club_points_table_header(line):
+                break
             if self._skip_line(line):
                 index += 1
                 continue
@@ -204,17 +215,45 @@ class FamResultsParser(BasePdfParser):
                 event["notes"].append(line)
                 index += 1
                 continue
+            if event["event_type"] == "relay":
+                relay_result = self._parse_relay_result_line(line, event.get("table_header", ""))
+                if relay_result:
+                    relay_group_counter += 1
+                    relay_group = relay_group_counter
+                    relay_result["relay_group"] = relay_group
+                    results.append(self._build_result(event, relay_result, {}, raw_lines=[line]))
+                    index += 1
+                    continue
+                relay_member = _parse_relay_member_line(line)
+                if relay_member:
+                    relay_member["member_order"] = len(relay_members) + 1
+                    relay_member["relay_group"] = relay_group
+                    relay_members.append(relay_member)
+                    index += 1
+                    continue
+                unparsed.append(line)
+                index += 1
+                continue
             if index + 1 >= len(lines):
                 unparsed.append(line)
                 index += 1
                 continue
 
-            first = self._parse_result_with_license(line, event["attempt_headers"], event["event_type"])
+            first = self._parse_result_with_license(
+                line,
+                event["attempt_headers"],
+                event["event_type"],
+                event["event_name"],
+                event.get("has_rt_column", False),
+            )
             if not first:
-                split_result = self._parse_split_fam_result(lines[index:index + 4], event)
+                for consumed in (5, 4):
+                    split_result = self._parse_split_fam_result(lines[index:index + consumed], event)
+                    if split_result:
+                        results.append(split_result)
+                        index += consumed
+                        break
                 if split_result:
-                    results.append(split_result)
-                    index += 4
                     continue
                 unparsed.append(line)
                 index += 1
@@ -235,21 +274,51 @@ class FamResultsParser(BasePdfParser):
         if not prefix:
             return None
 
-        birth_values = lines[3]["text"].split()
-        if not birth_values:
-            return None
-        birth_date = _parse_loose_date(birth_values[0])
-        if not birth_date:
-            return None
+        license_value = None
+        birth_date = None
+        mark_values = []
+        if len(lines) >= 5:
+            birth_tokens = lines[2]["text"].split()
+            license_tokens = lines[3]["text"].split()
+            birth_index = _find_birth_date_index(birth_tokens)
+            license_index = _find_license_index(license_tokens, from_right=True)
+            if birth_index is not None and license_index is not None:
+                birth_date = _parse_loose_date(birth_tokens[birth_index])
+                if birth_date:
+                    license_value = license_tokens[license_index]
+                    mark_values = lines[4]["text"].split()
+            if birth_date is None:
+                return None
 
-        mark_info = self._parse_mark_and_attempts(birth_values[1:], event["attempt_headers"], event["event_type"])
+        if birth_date is None:
+            birth_values = lines[3]["text"].split()
+            if not birth_values:
+                return None
+            birth_date = _parse_loose_date(birth_values[0])
+            if not birth_date:
+                return None
+            license_value = lines[2]["text"]
+            mark_values = birth_values[1:]
+
+        lane = None
+        if _is_400m_event(event.get("event_name")) and len(mark_values) >= 2 and mark_values[0].isdigit() and _looks_like_scored_result_mark(mark_values[1]):
+            lane = _to_int(mark_values[0])
+            mark_values = mark_values[1:]
+
+        mark_info = self._parse_mark_and_attempts(
+            mark_values,
+            event["attempt_headers"],
+            event["event_type"],
+            event["event_name"],
+            event.get("has_rt_column", False),
+        )
         first = {
             "position": prefix["position"],
             "dorsal": prefix["dorsal"],
             "athlete": " ".join(first_tokens[prefix["next_index"]:]),
-            "license": lines[2]["text"],
+            "license": license_value,
             "birth_date": birth_date.isoformat(),
-            "lane": None,
+            "lane": lane,
             "order_number": None,
             **mark_info,
         }
@@ -258,12 +327,20 @@ class FamResultsParser(BasePdfParser):
 
     def _parse_acta_events(self, page_lines: list[dict]) -> list[dict]:
         events = []
-        for page_number in sorted({line["page_number"] for line in page_lines}):
-            lines = [line for line in page_lines if line["page_number"] == page_number]
-            title_indexes = [index for index in range(len(lines)) if self._is_acta_event_title(lines, index)]
-            for position, start in enumerate(title_indexes):
-                end = title_indexes[position + 1] if position + 1 < len(title_indexes) else len(lines)
-                events.extend(self._parse_acta_event_block(lines[start:end]))
+        title_indexes = [index for index in range(len(page_lines)) if self._is_acta_event_title(page_lines, index)]
+        blocks: list[list[dict]] = []
+        for position, start in enumerate(title_indexes):
+            end = title_indexes[position + 1] if position + 1 < len(title_indexes) else len(page_lines)
+            block = page_lines[start:end]
+            if not block:
+                continue
+            if blocks and _acta_event_signature(blocks[-1]) == _acta_event_signature(block):
+                blocks[-1].extend(_strip_repeated_acta_event_header(block))
+            else:
+                blocks.append(block)
+
+        for block in blocks:
+            events.extend(self._parse_acta_event_block(block))
         return events
 
     def _is_acta_event_title(self, lines: list[dict], index: int) -> bool:
@@ -288,6 +365,7 @@ class FamResultsParser(BasePdfParser):
                 break
         attempt_headers = self._parse_acta_attempt_headers(table_header)
         event_type = self._detect_event_type(descriptor["event_name"], attempt_headers)
+        has_rt_column = _has_rt_column(table_header)
 
         round_indexes = [index for index, item in enumerate(block) if ACTA_ROUND.match(item["text"])]
         events = []
@@ -307,6 +385,7 @@ class FamResultsParser(BasePdfParser):
             )
             event["attempt_headers"] = attempt_headers
             event["event_type"] = event_type
+            event["has_rt_column"] = has_rt_column
             event["round_type"] = self._round_type(round_name)
             event["results"], event["unparsed_lines"] = self._parse_acta_rows(
                 block[round_index + 1:next_round_index],
@@ -319,9 +398,14 @@ class FamResultsParser(BasePdfParser):
     def _parse_acta_rows(self, lines: list[dict], event: dict, table_header: str) -> tuple[list[dict], list[str]]:
         results = []
         unparsed = []
+        relay_members = event.setdefault("relay_members", [])
+        relay_group = None
+        relay_group_counter = 0
         index = 0
         while index < len(lines):
             line = lines[index]["text"]
+            if _is_club_points_table_header(line):
+                break
             if self._skip_line(line):
                 index += 1
                 continue
@@ -330,7 +414,34 @@ class FamResultsParser(BasePdfParser):
                 index += 1
                 continue
 
-            first = self._parse_acta_result_line(line, event["attempt_headers"], event["event_type"], table_header)
+            if event["event_type"] == "relay":
+                relay_result = self._parse_relay_result_line(line, table_header)
+                if relay_result:
+                    relay_group_counter += 1
+                    relay_group = relay_group_counter
+                    relay_result["relay_group"] = relay_group
+                    results.append(self._build_result(event, relay_result, {}, raw_lines=[line]))
+                    index += 1
+                    continue
+                relay_member = _parse_relay_member_line(line)
+                if relay_member:
+                    relay_member["member_order"] = len(relay_members) + 1
+                    relay_member["relay_group"] = relay_group
+                    relay_members.append(relay_member)
+                    index += 1
+                    continue
+                unparsed.append(line)
+                index += 1
+                continue
+
+            first = self._parse_acta_result_line(
+                line,
+                event["attempt_headers"],
+                event["event_type"],
+                table_header,
+                event["event_name"],
+                event.get("has_rt_column", False),
+            )
             if not first:
                 unparsed.append(line)
                 index += 1
@@ -379,6 +490,7 @@ class FamResultsParser(BasePdfParser):
             "raw_header_text": raw_header_text,
             "notes": [],
             "results": [],
+            "relay_members": [],
             "unparsed_lines": [],
         }
 
@@ -400,6 +512,9 @@ class FamResultsParser(BasePdfParser):
             category_text = normalize_category_alias(category_match.group("category"))
             event_name = before_sex[: category_match.start()].strip()
 
+        event_name = _normalize_event_name(event_name)
+        round_name = _clean_round_name(round_name)
+
         implement = None
         implement_match = re.search(r"\((?P<implement>[^)]+)\)", event_name)
         if implement_match:
@@ -420,7 +535,7 @@ class FamResultsParser(BasePdfParser):
             content = re.sub(r"^(FN|Cat\.)\s*", "", content).strip()
             content = re.sub(r"^Pto\.\s*Dorsal\s*Atleta\s*", "", content).strip()
             content = re.sub(r"^Pto\.\s*DorsalAtleta\s*", "", content).strip()
-            content = re.sub(r"\b(Resultado|Marca)\b", "", content).strip()
+            content = re.sub(r"\b(Resultado|Marca|Intentos|Puntos?|RT)\b", "", content).strip()
             content = content.replace("Lic.", "").strip()
             if not content:
                 continue
@@ -429,18 +544,63 @@ class FamResultsParser(BasePdfParser):
 
     def _parse_acta_attempt_headers(self, table_header: str) -> list[str]:
         content = re.sub(r"^Pto\s+Dor\s*", "", table_header).strip()
-        content = re.sub(r"\b(Calle|Orden|Marca|Resultado)\b", "", content).strip()
+        content = re.sub(r"\b(Calle|Orden|Marca|Resultado|Intentos|Puntos?|RT)\b", "", content).strip()
         return content.split() if content else []
 
     def _detect_event_type(self, event_name: str, attempt_headers: list[str]) -> str:
         normalized = normalize_name(event_name)
+        if RELAY_EVENT_NAME.match(_normalize_event_name(event_name)):
+            return "relay"
         if "ALTURA" in normalized or "PERTIGA" in normalized:
             return "height"
         if attempt_headers:
             return "field"
         return "race"
 
-    def _parse_result_with_license(self, line: str, attempt_headers: list[str], event_type: str) -> dict | None:
+    def _parse_relay_result_line(self, line: str, table_header: str) -> dict | None:
+        tokens = line.split()
+        if len(tokens) < 3 or not tokens[0].isdigit():
+            return None
+
+        mark_index = _find_relay_mark_index(tokens)
+        if mark_index is None or mark_index <= 1:
+            return None
+
+        lane = None
+        club_start = 1
+        if "Calle" in table_header and tokens[1].isdigit():
+            lane = _to_int(tokens[1])
+            club_start = 2
+
+        club_end = mark_index
+        if lane is None and mark_index > club_start and tokens[mark_index - 1].isdigit():
+            lane = _to_int(tokens[mark_index - 1])
+            club_end = mark_index - 1
+
+        club_tokens = tokens[club_start:club_end]
+        if not club_tokens:
+            return None
+
+        mark_info = self._parse_mark_and_attempts([_clean_relay_mark(tokens[mark_index])], [], "relay")
+        return {
+            "position": int(tokens[0]),
+            "dorsal": None,
+            "athlete": "",
+            "club": " ".join(club_tokens),
+            "birth_date": None,
+            "lane": lane,
+            "order_number": None,
+            **mark_info,
+        }
+
+    def _parse_result_with_license(
+        self,
+        line: str,
+        attempt_headers: list[str],
+        event_type: str,
+        event_name: str | None = None,
+        has_rt_column: bool = False,
+    ) -> dict | None:
         tokens = line.split()
         prefix = _parse_position_dorsal(tokens)
         if not prefix:
@@ -451,7 +611,7 @@ class FamResultsParser(BasePdfParser):
             return None
 
         values = rest[license_index + 1:]
-        mark_info = self._parse_mark_and_attempts(values, attempt_headers, event_type)
+        mark_info = self._parse_mark_and_attempts(values, attempt_headers, event_type, event_name, has_rt_column)
         return {
             "position": prefix["position"],
             "dorsal": prefix["dorsal"],
@@ -462,7 +622,15 @@ class FamResultsParser(BasePdfParser):
             "order_number": None,
         }
 
-    def _parse_acta_result_line(self, line: str, attempt_headers: list[str], event_type: str, table_header: str) -> dict | None:
+    def _parse_acta_result_line(
+        self,
+        line: str,
+        attempt_headers: list[str],
+        event_type: str,
+        table_header: str,
+        event_name: str | None = None,
+        has_rt_column: bool = False,
+    ) -> dict | None:
         tokens = line.split()
         birth_index = _find_birth_date_index(tokens)
         if birth_index is None:
@@ -486,7 +654,7 @@ class FamResultsParser(BasePdfParser):
             order_number = _to_int(values[0])
             values = values[1:]
 
-        mark_info = self._parse_mark_and_attempts(values, attempt_headers, event_type)
+        mark_info = self._parse_mark_and_attempts(values, attempt_headers, event_type, event_name, has_rt_column)
         return {
             "position": prefix["position"],
             "dorsal": prefix["dorsal"],
@@ -525,11 +693,16 @@ class FamResultsParser(BasePdfParser):
             category_calculated = category_from_birth_date(_parse_iso_date(event["date"]), _parse_iso_date(birth_date))
         category_text = tail.get("category_text") or event.get("category_text")
         athlete = first.get("athlete", "").strip()
+        cleaned_raw_lines = _clean_result_raw_lines(
+            raw_lines,
+            event["event_type"],
+            event.get("has_rt_column", False),
+        )
         return {
             "position": first.get("position"),
             "dorsal": first.get("dorsal"),
             "athlete": athlete,
-            "club": tail.get("club"),
+            "club": first.get("club") or tail.get("club"),
             "license": first.get("license") or tail.get("license"),
             "birth_date": birth_date,
             "athlete_key": f"{normalize_name(athlete)}|{birth_date}" if birth_date else None,
@@ -543,10 +716,21 @@ class FamResultsParser(BasePdfParser):
             "status_original": first.get("status_original"),
             "wind": event.get("wind"),
             "attempts": first.get("attempts", []),
-            "raw_text": "\n".join(raw_lines),
+            "raw_text": "\n".join(cleaned_raw_lines),
+            "parse_warnings": _rt_parse_warnings(raw_lines, cleaned_raw_lines, event["event_type"]),
+            "relay_group": first.get("relay_group"),
         }
 
-    def _parse_mark_and_attempts(self, raw_values: list[str], attempt_headers: list[str], event_type: str) -> dict:
+    def _parse_mark_and_attempts(
+        self,
+        raw_values: list[str],
+        attempt_headers: list[str],
+        event_type: str,
+        event_name: str | None = None,
+        has_rt_column: bool = False,
+    ) -> dict:
+        raw_values = _remove_rt_column_or_tokens_if_present(raw_values, event_type, has_rt_column)
+        raw_values = _without_team_points(raw_values, attempt_headers, event_type)
         if not raw_values:
             return {"mark": None, "status": "UNKNOWN", "status_original": None, "attempts": []}
 
@@ -638,9 +822,20 @@ class FamResultsParser(BasePdfParser):
             or line.startswith("Lic.")
             or line.startswith("Pto.")
             or line.startswith("Pto Dor")
-            or line in {"FN", "Cat.", "Club Lic", "Nombre F de Nac", "Final"}
+            or line in {
+                "FN",
+                "Cat.",
+                "Club Lic",
+                "Nombre F de Nac",
+                "Equipo F de Nac",
+                "Relevistas Lic",
+                "Final",
+                "ACTA DEL CAMPEONATO",
+            }
+            or SPANISH_DATE_LINE.match(line)
             or line.startswith("Pto. Puesto")
             or re.match(r"^(DNS|DQ|DNF|NP|NM|SM)\b", line)
+            or _looks_like_acta_page_title(line)
             or "LICENCIA - " in normalized
             or "INFRACCION" in normalized
             or "NO PRESENTADO" in normalized
@@ -695,6 +890,234 @@ def _find_birth_date_index(tokens: list[str]) -> int | None:
         if _parse_loose_date(token):
             return index
     return None
+
+
+def _without_team_points(raw_values: list[str], attempt_headers: list[str], event_type: str) -> list[str]:
+    if len(raw_values) < 2:
+        return raw_values
+    if event_type == "height" and not _height_headers_are_bar_heights(attempt_headers):
+        return _height_summary_mark_only(raw_values)
+    if not _looks_like_team_points(raw_values[-1]):
+        return raw_values
+
+    previous = raw_values[-2]
+    if previous.upper() in STATUS_MAP:
+        return raw_values[:-1]
+
+    if event_type == "height" and _height_headers_are_bar_heights(attempt_headers):
+        expected_with_attempt_count_and_points = len(attempt_headers) + 3
+        if (
+            len(raw_values) == expected_with_attempt_count_and_points
+            and _looks_like_team_points(raw_values[-1])
+            and _looks_like_team_points(raw_values[-2])
+            and _looks_like_result_mark(raw_values[-3])
+        ):
+            return raw_values[:-2]
+
+    if event_type == "field" and _looks_like_scored_result_mark(previous):
+        return raw_values[:-1]
+
+    if event_type in {"race", "relay"} and len(raw_values) == 2 and _looks_like_scored_result_mark(previous):
+        return raw_values[:-1]
+
+    return raw_values
+
+
+def _remove_rt_column_or_tokens_if_present(raw_values: list[str], event_type: str, has_rt_column: bool = False) -> list[str]:
+    if event_type != "race" or not raw_values:
+        return raw_values
+    rt_index = next((index for index, value in enumerate(raw_values) if value.upper() == "RT"), None)
+    if rt_index is not None:
+        return raw_values[:rt_index]
+    if has_rt_column and len(raw_values) >= 2 and _looks_like_reaction_time(raw_values[-1]):
+        return raw_values[:-1]
+    return raw_values
+
+
+def _clean_result_raw_lines(raw_lines: list[str], event_type: str, has_rt_column: bool = False) -> list[str]:
+    if event_type != "race":
+        return raw_lines
+    cleaned_lines = []
+    for line in raw_lines:
+        tokens = line.split()
+        cleaned_tokens = _remove_rt_column_or_tokens_if_present(tokens, event_type, has_rt_column)
+        cleaned_lines.append(" ".join(cleaned_tokens) if cleaned_tokens != tokens else line)
+    return cleaned_lines
+
+
+def _rt_parse_warnings(raw_lines: list[str], cleaned_raw_lines: list[str], event_type: str) -> list[dict]:
+    if event_type != "race":
+        return []
+    warnings = []
+    for raw_line, cleaned_line in zip(raw_lines, cleaned_raw_lines):
+        if raw_line == cleaned_line:
+            continue
+        warnings.append(
+            {
+                "error_type": "RT_IGNORED",
+                "raw_text": raw_line,
+                "message": "Se ha ignorado la columna RT de la fila de resultado",
+            }
+        )
+    return warnings
+
+
+def _is_400m_event(event_name: str | None) -> bool:
+    normalized = normalize_name(event_name or "")
+    compact = re.sub(r"[\s.]+", "", normalized)
+    return compact == "400M"
+
+
+def _has_rt_column(*headers: str) -> bool:
+    return any(re.search(r"\bRT\b", header, re.IGNORECASE) for header in headers if header)
+
+
+def _looks_like_reaction_time(value: str) -> bool:
+    return bool(re.fullmatch(r"0[.,]\d{2,3}", value.strip()))
+
+
+def _height_headers_are_bar_heights(attempt_headers: list[str]) -> bool:
+    return bool(attempt_headers) and all(_is_decimal(header) for header in attempt_headers)
+
+
+def _height_summary_mark_only(raw_values: list[str]) -> list[str]:
+    first = raw_values[0]
+    if first.upper() in STATUS_MAP or _looks_like_result_mark(first):
+        return [first]
+    return raw_values
+
+
+def _looks_like_team_points(value: str) -> bool:
+    return bool(re.fullmatch(r"\d+(?:[.,]5)?", value.strip()))
+
+
+def _looks_like_result_mark(value: str) -> bool:
+    value = value.strip()
+    return bool(
+        re.fullmatch(r"\d{1,2}:\d{2}(?:[.,]\d+)?-?", value)
+        or re.fullmatch(r"\d+(?:[.,]\d+)?", value)
+    )
+
+
+def _looks_like_scored_result_mark(value: str) -> bool:
+    value = value.strip()
+    return bool(
+        re.fullmatch(r"\d{1,2}:\d{2}(?:[.,]\d+)?-?", value)
+        or re.fullmatch(r"\d+[.,]\d+", value)
+    )
+
+
+def _acta_event_signature(block: list[dict]) -> tuple[str | None, str | None, str | None]:
+    if not block:
+        return None, None, None
+    descriptor = _parse_acta_descriptor_for_signature(block[0]["text"])
+    return descriptor.get("event_name"), descriptor.get("category_text"), descriptor.get("sex")
+
+
+def _parse_acta_descriptor_for_signature(text: str) -> dict:
+    sex_match = SEX.search(text)
+    sex = None
+    before_sex = text
+    if sex_match:
+        sex_text = sex_match.group("sex").lower()
+        sex = "F" if sex_text.startswith("f") else "M"
+        before_sex = text[: sex_match.start()].strip()
+
+    category_match = TEXT_CATEGORY.search(before_sex)
+    category_text = None
+    event_name = before_sex
+    if category_match:
+        category_text = normalize_category_alias(category_match.group("category"))
+        event_name = before_sex[: category_match.start()].strip()
+
+    return {
+        "event_name": normalize_name(_normalize_event_name(event_name)),
+        "category_text": category_text,
+        "sex": sex,
+    }
+
+
+def _strip_repeated_acta_event_header(block: list[dict]) -> list[dict]:
+    stripped = []
+    for index, item in enumerate(block):
+        line = item["text"]
+        if index == 0:
+            continue
+        if line in {"ACTA DEL CAMPEONATO", "Final", "Nombre F de Nac", "Club Lic"}:
+            continue
+        if line.startswith("Pto Dor"):
+            continue
+        stripped.append(item)
+    return stripped
+
+
+def _is_club_points_table_header(line: str) -> bool:
+    normalized = normalize_name(line)
+    return normalized.startswith("PTO CLUB PUNTOS POR PUESTO")
+
+
+def _looks_like_acta_page_title(line: str) -> bool:
+    normalized = normalize_name(line)
+    return (
+        not SEX.search(line)
+        and (
+            normalized.startswith("CAMPEONATO ")
+            or normalized.startswith("CTO ")
+            or normalized.startswith("CAMP. ")
+            or normalized.startswith("REUNION ")
+            or normalized.startswith("JORNADA ")
+        )
+    )
+
+
+def _find_relay_mark_index(tokens: list[str]) -> int | None:
+    for index in range(len(tokens) - 1, 0, -1):
+        token = tokens[index].strip()
+        if token.upper() in STATUS_MAP or RELAY_MARK.match(token):
+            return index
+    return None
+
+
+def _parse_relay_member_line(line: str) -> dict | None:
+    tokens = line.split()
+    if len(tokens) < 4 or not tokens[0].isdigit():
+        return None
+    birth_index = _find_birth_date_index(tokens)
+    license_index = _find_license_index(tokens, from_right=True)
+    if birth_index is None or license_index is None or license_index <= birth_index:
+        return None
+    birth_date = _parse_loose_date(tokens[birth_index])
+    athlete_tokens = tokens[1:birth_index]
+    if athlete_tokens and athlete_tokens[0].lower() == "(f)":
+        athlete_tokens = athlete_tokens[1:]
+    athlete_name = " ".join(athlete_tokens).strip()
+    if not athlete_name:
+        return None
+    return {
+        "bib_number": tokens[0],
+        "athlete_name": athlete_name,
+        "birth_date": birth_date.isoformat() if birth_date else None,
+        "license": tokens[license_index],
+        "raw_text": line,
+    }
+
+
+def _clean_relay_mark(value: str) -> str:
+    return value.rstrip("-")
+
+
+def _normalize_event_name(event_name: str) -> str:
+    value = re.sub(r"\s+", " ", event_name).strip()
+    return value
+
+
+def _clean_round_name(round_name: str | None) -> str | None:
+    if not round_name:
+        return None
+    cleaned = round_name.strip(" .")
+    if not cleaned or cleaned.upper() == "PC":
+        return None
+    return cleaned
 
 
 def _split_text_date_tail(line: str) -> tuple[str, date | None]:

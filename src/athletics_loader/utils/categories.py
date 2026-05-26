@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+import unicodedata
 
 from athletics_loader.utils.dates import calculate_age
 
@@ -20,17 +21,22 @@ CATEGORY_ALIASES = {
     "SENIOR": "SENIOR/ABSOLUTA",
     "SEN": "SENIOR/ABSOLUTA",
     "SESN": "SENIOR/ABSOLUTA",
+    "MASTER": "MASTER",
 }
 
 
 def normalize_category_alias(value: str | None) -> str | None:
     if not value:
         return None
-    normalized = value.strip().upper().replace(" ", "-")
+    normalized = unicodedata.normalize("NFKD", value.strip())
+    normalized = "".join(c for c in normalized if not unicodedata.combining(c))
+    normalized = normalized.upper().replace(" ", "-")
     if normalized.startswith("SUB-"):
         return normalized
     if normalized.startswith("SUB") and normalized[3:].isdigit():
         return f"SUB-{normalized[3:]}"
+    if normalized.startswith("MASTER"):
+        return "MASTER"
     if normalized.startswith("S") and normalized[1:].isdigit():
         return f"SUB-{normalized[1:]}"
     if normalized[0:1] in {"M", "F"} and normalized[1:].isdigit():

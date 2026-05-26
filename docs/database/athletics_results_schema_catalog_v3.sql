@@ -189,7 +189,7 @@ CREATE TABLE competition_events (
 CREATE TABLE results (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
   competition_event_id BIGINT NOT NULL,
-  athlete_id BIGINT NOT NULL,
+  athlete_id BIGINT NULL,
   club_id BIGINT NULL,
   bib_number VARCHAR(30) NULL,
   position INT NULL,
@@ -228,6 +228,26 @@ CREATE TABLE result_attempts (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE KEY uk_result_attempts (result_id, attempt_number, height_or_distance),
   CONSTRAINT fk_attempts_result FOREIGN KEY (result_id) REFERENCES results(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE relay_result_members (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  result_id BIGINT NULL,
+  competition_event_id BIGINT NOT NULL,
+  source_file_id BIGINT NULL,
+  member_order INT NULL,
+  bib_number VARCHAR(30) NULL,
+  athlete_name VARCHAR(255) NOT NULL,
+  birth_date DATE NULL,
+  license VARCHAR(100) NULL,
+  raw_text TEXT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_rrm_result (result_id),
+  KEY idx_rrm_event (competition_event_id),
+  KEY idx_rrm_source_file (source_file_id),
+  CONSTRAINT fk_rrm_result FOREIGN KEY (result_id) REFERENCES results(id) ON DELETE CASCADE,
+  CONSTRAINT fk_rrm_event FOREIGN KEY (competition_event_id) REFERENCES competition_events(id),
+  CONSTRAINT fk_rrm_source_file FOREIGN KEY (source_file_id) REFERENCES source_files(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE import_errors (
