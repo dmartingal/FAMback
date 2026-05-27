@@ -14,13 +14,13 @@ DATE_EVENT_HEADER = re.compile(r"^(?P<date>\d{2}/\d{2}/\d{4})\s+(?P<name>.+)$")
 INLINE_EVENT_HEADER = re.compile(r"^(?P<time>\d{2}:\d{2})\s+(?P<date>\d{2}/\d{2}/\d{4})\s+(?P<name>.+)$")
 WIND = re.compile(r"^Viento:\s*(?P<wind>[+-]?\d+(?:[.,]\d+)?)$", re.IGNORECASE)
 ACTA_ROUND = re.compile(
-    r"^(?P<round>(?:Serie\s+\d+)|(?:Final(?:\s+[A-Z])?))\s+"
+    r"^(?P<round>(?:Serie\s+\d+)|(?:Semifinal(?:\s+(?:\d+|[A-Z]))?)|(?:Final(?:\s+[A-Z])?))\s+"
     r"(?P<date>\d{2}/\d{2}/\d{4})\s+(?P<time>\d{2}:\d{2})$",
     re.IGNORECASE,
 )
 SEX = re.compile(r"\b(?P<sex>Femenino|Masculino|Fem|Masc)\b", re.IGNORECASE)
 TEXT_CATEGORY = re.compile(
-    "\\b(?P<category>Sub\\s*\\d{1,2}|M[a\\u00e1]ster(?:\\s*-?\\s*\\d{2,3})?|Abs|Infantil|Inf|Cadete|Cad|Juvenil|Juv|Junior|Promesa|Absolut[ao]|Senior)\\b",
+    "\\b(?P<category>Sub\\s*\\d{1,2}(?:\\s*-\\s*\\d{1,2})?|M[a\\u00e1]ster(?:\\s*-?\\s*\\d{2,3})?|Abs|Infantil|Inf|Cadete|Cad|Juvenil|Juv|Junior|Promesa|Absolut[ao]|Senior)\\b",
     re.IGNORECASE,
 )
 SPANISH_DATE_LINE = re.compile(
@@ -38,6 +38,7 @@ STATUS_MAP = {
 
 RELAY_EVENT_NAME = re.compile(r"^\d+x\d+m?$", re.IGNORECASE)
 RELAY_MARK = re.compile(r"^(?:\d{1,2}:\d{2}(?:[.,]\d+)?|\d{1,2}[.,]\d+)-?$")
+FIELD_EVENT_TERMS = ("LONGITUD", "TRIPLE", "PESO", "JABALINA", "DISCO", "MARTILLO")
 
 SPANISH_MONTHS = {
     "ene": 1,
@@ -351,8 +352,12 @@ class FamResultsParser(BasePdfParser):
             return False
         if not SEX.search(line):
             return False
-        next_line = lines[index + 1]["text"] if index + 1 < len(lines) else ""
-        return next_line in {"Final", "Nombre F de Nac"}
+        lookahead_end = min(index + 8, len(lines))
+        for lookahead in range(index + 1, lookahead_end):
+            next_line = lines[lookahead]["text"]
+            if _is_acta_round_heading(next_line) or _is_acta_results_header_line(next_line):
+                return True
+        return False
 
     def _parse_acta_event_block(self, block: list[dict]) -> list[dict]:
         if not block:
@@ -553,6 +558,8 @@ class FamResultsParser(BasePdfParser):
             return "relay"
         if "ALTURA" in normalized or "PERTIGA" in normalized:
             return "height"
+        if any(term in normalized for term in FIELD_EVENT_TERMS):
+            return "field"
         if attempt_headers:
             return "field"
         return "race"
@@ -730,6 +737,7 @@ class FamResultsParser(BasePdfParser):
         has_rt_column: bool = False,
     ) -> dict:
         raw_values = _remove_rt_column_or_tokens_if_present(raw_values, event_type, has_rt_column)
+        raw_values = _remove_race_qualification_suffixes(raw_values, event_type)
         raw_values = _without_team_points(raw_values, attempt_headers, event_type)
         if not raw_values:
             return {"mark": None, "status": "UNKNOWN", "status_original": None, "attempts": []}
@@ -809,6 +817,8 @@ class FamResultsParser(BasePdfParser):
         normalized = normalize_name(round_name)
         if "SERIE" in normalized:
             return "SERIE"
+        if "SEMIFINAL" in normalized:
+            return "CLASIFICACION"
         if "FINAL" in normalized:
             return "FINAL"
         if "GRUPO" in normalized or re.fullmatch(r"[A-Z]", round_name.strip()):
@@ -838,6 +848,7 @@ class FamResultsParser(BasePdfParser):
             or _looks_like_acta_page_title(line)
             or "LICENCIA - " in normalized
             or "INFRACCION" in normalized
+            or "CALIFICACION" in normalized
             or "NO PRESENTADO" in normalized
             or "DESCALIFICADO" in normalized
             or "PAGINA" in normalized
@@ -934,6 +945,15 @@ def _remove_rt_column_or_tokens_if_present(raw_values: list[str], event_type: st
     return raw_values
 
 
+def _remove_race_qualification_suffixes(raw_values: list[str], event_type: str) -> list[str]:
+    if event_type != "race":
+        return raw_values
+    values = raw_values
+    while len(values) >= 2 and values[-1].lower() == "q" and _looks_like_result_mark(values[-2]):
+        values = values[:-1]
+    return values
+
+
 def _clean_result_raw_lines(raw_lines: list[str], event_type: str, has_rt_column: bool = False) -> list[str]:
     if event_type != "race":
         return raw_lines
@@ -941,6 +961,7 @@ def _clean_result_raw_lines(raw_lines: list[str], event_type: str, has_rt_column
     for line in raw_lines:
         tokens = line.split()
         cleaned_tokens = _remove_rt_column_or_tokens_if_present(tokens, event_type, has_rt_column)
+        cleaned_tokens = _remove_race_qualification_suffixes(cleaned_tokens, event_type)
         cleaned_lines.append(" ".join(cleaned_tokens) if cleaned_tokens != tokens else line)
     return cleaned_lines
 
@@ -952,6 +973,8 @@ def _rt_parse_warnings(raw_lines: list[str], cleaned_raw_lines: list[str], event
     for raw_line, cleaned_line in zip(raw_lines, cleaned_raw_lines):
         if raw_line == cleaned_line:
             continue
+        if _removed_only_qualification_suffix(raw_line, cleaned_line):
+            continue
         warnings.append(
             {
                 "error_type": "RT_IGNORED",
@@ -960,6 +983,16 @@ def _rt_parse_warnings(raw_lines: list[str], cleaned_raw_lines: list[str], event
             }
         )
     return warnings
+
+
+def _removed_only_qualification_suffix(raw_line: str, cleaned_line: str) -> bool:
+    raw_tokens = raw_line.split()
+    cleaned_tokens = cleaned_line.split()
+    if len(raw_tokens) <= len(cleaned_tokens):
+        return False
+    return raw_tokens[: len(cleaned_tokens)] == cleaned_tokens and all(
+        token.lower() == "q" for token in raw_tokens[len(cleaned_tokens):]
+    )
 
 
 def _is_400m_event(event_name: str | None) -> bool:
@@ -1068,6 +1101,15 @@ def _looks_like_acta_page_title(line: str) -> bool:
             or normalized.startswith("JORNADA ")
         )
     )
+
+
+def _is_acta_round_heading(line: str) -> bool:
+    normalized = normalize_name(line.strip())
+    return normalized in {"FINAL", "SEMIFINAL"}
+
+
+def _is_acta_results_header_line(line: str) -> bool:
+    return line == "Nombre F de Nac" or line.startswith("Pto Dor")
 
 
 def _find_relay_mark_index(tokens: list[str]) -> int | None:

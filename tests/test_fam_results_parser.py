@@ -217,6 +217,77 @@ M123
     assert event["results"][0]["parse_warnings"][0]["raw_text"] == "11.34 0.156"
 
 
+def test_fam_parser_parses_acta_semifinal_with_qualification_text_and_q_suffix() -> None:
+    parser = FamResultsParser()
+    pages = [
+        """Campeonato de Madrid PC
+Madrid-Gallur, 11 enero 2026
+ACTA DEL CAMPEONATO
+60m Abs Fem
+Semifinal
+Calificacion: Los 8 con mejores tiempos (q) progresan a la Final
+Nombre F de Nac
+Pto Dor Calle Marca
+Club Lic
+Semifinal 1 11/01/2026 12:00
+1 415 Salome Carrasco Rebollo 16/02/2006 5 7.75 q
+EAMJ Playas de Jandia M11981"""
+    ]
+
+    result = parser.parse(Path("acta-semifinal-q.pdf"), pages)
+
+    assert result["events_detected"] == 1
+    event = result["events"][0]
+    assert event["event_name"] == "60m"
+    assert event["category_text"] == "SENIOR/ABSOLUTA"
+    assert event["sex"] == "F"
+    assert event["round_name"] == "Semifinal 1"
+    assert event["round_type"] == "CLASIFICACION"
+    assert event["results"][0]["lane"] == 5
+    assert event["results"][0]["mark"] == "7.75"
+    assert event["results"][0]["attempts"] == []
+    assert " q" not in event["results"][0]["raw_text"]
+    assert event["results"][0]["parse_warnings"] == []
+
+
+def test_fam_parser_starts_sub_16_18_semifinal_after_field_event() -> None:
+    parser = FamResultsParser()
+    pages = [
+        """Campeonato de Madrid PC
+Madrid-Gallur, 11 enero 2026
+ACTA DEL CAMPEONATO
+Peso (7,260kg) Sub 16 Masc
+Final
+Nombre F de Nac
+Pto Dor 1 2 3 Marca
+Club Lic
+Final 11/01/2026 10:00
+1 10 Lanzador Uno 01/01/2010 8.00 8.20 8.10 8.20
+Club Peso M1
+60m Vallas (0,762) Sub 16-18 Fem
+Semifinal
+Nombre F de Nac
+Pto Dor Calle Marca
+Club Lic
+Semifinal 1 11/01/2026 10:20
+1 11 Vallista Una 01/01/2010 4 9.20
+Club Vallas M2"""
+    ]
+
+    result = parser.parse(Path("acta-sub16-18-hurdles.pdf"), pages)
+
+    assert result["events_detected"] == 2
+    weight_event, hurdles_event = result["events"]
+    assert weight_event["event_name"] == "Peso (7,260kg)"
+    assert weight_event["event_type"] == "field"
+    assert weight_event["results"][0]["mark"] == "8.20"
+    assert hurdles_event["event_name"] == "60m Vallas (0,762)"
+    assert hurdles_event["category_text"] == "SUB-16-18"
+    assert hurdles_event["event_type"] == "race"
+    assert hurdles_event["round_name"] == "Semifinal 1"
+    assert hurdles_event["results"][0]["mark"] == "9.20"
+
+
 def test_fam_parser_ignores_repeated_meeting_title_inside_result_block() -> None:
     parser = FamResultsParser()
     pages = [
