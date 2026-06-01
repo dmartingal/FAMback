@@ -20,7 +20,6 @@ src/athletics_loader/pdf/parsers/__init__.py
 src/athletics_loader/pdf/parsers/base.py
 src/athletics_loader/pdf/parsers/fam_results_parser.py
 src/athletics_loader/services/__init__.py
-src/athletics_loader/services/athlete_service.py
 src/athletics_loader/services/club_service.py
 src/athletics_loader/services/competition_service.py
 src/athletics_loader/services/pdf_results_import_service.py

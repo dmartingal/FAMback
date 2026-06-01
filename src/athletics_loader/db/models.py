@@ -67,12 +67,11 @@ class Athlete(Base):
     __tablename__ = "athletes"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     full_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    full_name_normalized: Mapped[str] = mapped_column(String(255), nullable=False)
-    birth_date: Mapped[date] = mapped_column(Date, nullable=False)
+    full_name_normalized: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    birth_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     gender: Mapped[str | None] = mapped_column(String(1), nullable=True)
     current_license: Mapped[str | None] = mapped_column(String(100), nullable=True)
     current_license_normalized: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    athlete_key: Mapped[str] = mapped_column(String(350), nullable=False)
 
 
 class AthleteLicense(Base):

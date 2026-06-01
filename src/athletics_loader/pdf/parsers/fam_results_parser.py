@@ -712,7 +712,6 @@ class FamResultsParser(BasePdfParser):
             "club": first.get("club") or tail.get("club"),
             "license": first.get("license") or tail.get("license"),
             "birth_date": birth_date,
-            "athlete_key": f"{normalize_name(athlete)}|{birth_date}" if birth_date else None,
             "category_calculated": category_calculated,
             "category_text": category_text,
             "category": category_text or category_calculated,
@@ -737,6 +736,7 @@ class FamResultsParser(BasePdfParser):
         has_rt_column: bool = False,
     ) -> dict:
         raw_values = _remove_rt_column_or_tokens_if_present(raw_values, event_type, has_rt_column)
+        raw_values = _remove_result_annotation_suffixes(raw_values)
         raw_values = _remove_race_qualification_suffixes(raw_values, event_type)
         raw_values = _without_team_points(raw_values, attempt_headers, event_type)
         if not raw_values:
@@ -961,6 +961,7 @@ def _clean_result_raw_lines(raw_lines: list[str], event_type: str, has_rt_column
     for line in raw_lines:
         tokens = line.split()
         cleaned_tokens = _remove_rt_column_or_tokens_if_present(tokens, event_type, has_rt_column)
+        cleaned_tokens = _remove_result_annotation_suffixes(cleaned_tokens)
         cleaned_tokens = _remove_race_qualification_suffixes(cleaned_tokens, event_type)
         cleaned_lines.append(" ".join(cleaned_tokens) if cleaned_tokens != tokens else line)
     return cleaned_lines
@@ -974,6 +975,8 @@ def _rt_parse_warnings(raw_lines: list[str], cleaned_raw_lines: list[str], event
         if raw_line == cleaned_line:
             continue
         if _removed_only_qualification_suffix(raw_line, cleaned_line):
+            continue
+        if _removed_only_result_annotation_suffix(raw_line, cleaned_line):
             continue
         warnings.append(
             {
@@ -992,6 +995,27 @@ def _removed_only_qualification_suffix(raw_line: str, cleaned_line: str) -> bool
         return False
     return raw_tokens[: len(cleaned_tokens)] == cleaned_tokens and all(
         token.lower() == "q" for token in raw_tokens[len(cleaned_tokens):]
+    )
+
+
+def _remove_result_annotation_suffixes(raw_values: list[str]) -> list[str]:
+    values = raw_values
+    while len(values) >= 2 and _is_result_annotation_token(values[-1]):
+        values = values[:-1]
+    return values
+
+
+def _is_result_annotation_token(value: str) -> bool:
+    return bool(re.fullmatch(r"(?:YC|RT\d+(?:\.\d+)*)", value.strip(), re.IGNORECASE))
+
+
+def _removed_only_result_annotation_suffix(raw_line: str, cleaned_line: str) -> bool:
+    raw_tokens = raw_line.split()
+    cleaned_tokens = cleaned_line.split()
+    if len(raw_tokens) <= len(cleaned_tokens):
+        return False
+    return raw_tokens[: len(cleaned_tokens)] == cleaned_tokens and all(
+        _is_result_annotation_token(token) for token in raw_tokens[len(cleaned_tokens):]
     )
 
 

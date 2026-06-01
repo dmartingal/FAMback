@@ -43,7 +43,8 @@ M8082
     assert event["results"][0]["dorsal"] == "458"
     assert event["results"][0]["mark"] == "12.22"
     assert event["results"][0]["status"] == "OK"
-    assert event["results"][0]["athlete_key"] == "AINHOA GARCIA PINTADO|2009-04-29"
+    assert event["results"][0]["birth_date"] == "2009-04-29"
+    assert "athlete_key" not in event["results"][0]
     assert event["results"][1]["position"] is None
     assert event["results"][1]["status"] == "DNS"
 
@@ -215,6 +216,62 @@ M123
     assert event["results"][0]["attempts"] == []
     assert "0.156" not in event["results"][0]["raw_text"]
     assert event["results"][0]["parse_warnings"][0]["raw_text"] == "11.34 0.156"
+
+
+def test_fam_parser_ignores_yc_annotation_after_race_mark() -> None:
+    parser = FamResultsParser()
+    pages = [
+        """Campeonato de Madrid PC
+Madrid-Gallur, 11 enero 2026
+ACTA DEL CAMPEONATO
+60m Vallas (0,762) Sub 16 Fem
+Final
+Nombre F de Nac
+Pto Dor Calle Marca
+Club Lic
+Final 11/01/2026 12:00
+2 249 Daniela Borrego Mora 06/03/2011 7 9.48 YC
+Atletismo Leganes M28667"""
+    ]
+
+    result = parser.parse(Path("acta-yc-annotation.pdf"), pages)
+
+    event = result["events"][0]
+    parsed_result = event["results"][0]
+    assert parsed_result["lane"] == 7
+    assert parsed_result["mark"] == "9.48"
+    assert parsed_result["attempts"] == []
+    assert "YC" not in parsed_result["raw_text"]
+    assert parsed_result["parse_warnings"] == []
+
+
+def test_fam_parser_ignores_rt_rule_annotation_suffix_after_race_mark() -> None:
+    parser = FamResultsParser()
+    pages = [
+        """Campeonato de Madrid PC
+Madrid-Gallur, 11 enero 2026
+ACTA DEL CAMPEONATO
+60m Sub 16 Fem
+Final
+Nombre F de Nac
+Pto Dor Calle Marca
+Club Lic
+Final 11/01/2026 12:00
+1 101 Ana Perez Gomez 01/01/2011 3 9.48 RT16.8
+Club A M101
+2 102 Bea Lopez Ruiz 02/02/2011 4 9.49 Rt17.3.3
+Club B M102
+3 103 Clara Sanz Gil 03/03/2011 5 9.50 rt17.3.3
+Club C M103"""
+    ]
+
+    result = parser.parse(Path("acta-rt-rule-annotation.pdf"), pages)
+
+    event = result["events"][0]
+    assert [parsed_result["mark"] for parsed_result in event["results"]] == ["9.48", "9.49", "9.50"]
+    assert all(parsed_result["attempts"] == [] for parsed_result in event["results"])
+    assert all("RT" not in parsed_result["raw_text"].upper() for parsed_result in event["results"])
+    assert all(parsed_result["parse_warnings"] == [] for parsed_result in event["results"])
 
 
 def test_fam_parser_parses_acta_semifinal_with_qualification_text_and_q_suffix() -> None:
@@ -691,7 +748,7 @@ Pto. Club Resultado
     assert event["results"][0]["club"] == "A.D. Marathon"
     assert event["results"][0]["mark"] == "3:51.23"
     assert event["results"][0]["birth_date"] is None
-    assert event["results"][0]["athlete_key"] is None
+    assert "athlete_key" not in event["results"][0]
 
 
 def test_fam_parser_parses_acta_relay_results_with_lane() -> None:

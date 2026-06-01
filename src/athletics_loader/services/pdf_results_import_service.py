@@ -127,7 +127,23 @@ class PdfResultsImportService:
                     summary["warnings"] += 1
 
                 is_relay_result = event.get("event_type") == "relay"
-                if not is_relay_result and (not result.get("birth_date") or not result.get("athlete_key")):
+                athlete = None
+                if not is_relay_result and result.get("athlete"):
+                    athlete, athlete_warnings = self._get_or_create_athlete(db, result, event.get("sex"))
+                    for warning_type, warning_message in athlete_warnings:
+                        self._add_event_import_error(
+                            db,
+                            source,
+                            event,
+                            competition_event,
+                            event.get("page_number"),
+                            result.get("raw_text"),
+                            warning_type,
+                            warning_message,
+                            result,
+                        )
+                        summary["warnings"] += 1
+                elif not is_relay_result:
                     self._add_event_import_error(
                         db,
                         source,
@@ -135,12 +151,11 @@ class PdfResultsImportService:
                         competition_event,
                         event.get("page_number"),
                         result.get("raw_text"),
-                        "MISSING_BIRTH_DATE",
-                        "No se inserta el atleta porque el PDF no aporta fecha de nacimiento",
+                        "ATHLETE_NOT_LINKED",
+                        "El PDF no aporta nombre de atleta; se inserta el resultado sin enlazar atleta",
                         result,
                     )
-                    summary["errors"] += 1
-                    continue
+                    summary["warnings"] += 1
 
                 club = self._get_or_create_club(db, result.get("club"))
                 if is_relay_result and not club:
@@ -158,7 +173,6 @@ class PdfResultsImportService:
                     summary["errors"] += 1
                     continue
 
-                athlete = None if is_relay_result else self._get_or_create_athlete(db, result, event.get("sex"))
                 if athlete and result.get("license"):
                     self._get_or_create_athlete_license(db, athlete, result["license"], source, competition)
                 if athlete and club:
@@ -223,29 +237,48 @@ class PdfResultsImportService:
             db.flush()
         return club
 
-    def _get_or_create_athlete(self, db: Session, result: dict, gender: str | None) -> Athlete:
-        athlete_key = result["athlete_key"]
-        athlete = db.scalar(select(Athlete).where(Athlete.athlete_key == athlete_key))
+    def _get_or_create_athlete(self, db: Session, result: dict, gender: str | None) -> tuple[Athlete, list[tuple[str, str]]]:
+        warnings = []
+        full_name = result["athlete"]
+        full_name_normalized = normalize_name(full_name)
+        athlete = db.scalar(select(Athlete).where(Athlete.full_name_normalized == full_name_normalized))
+        birth_date = _parse_iso_date(result.get("birth_date"))
         license_code = result.get("license")
         license_normalized = _db_normalized(license_code) if license_code else None
         if not athlete:
             athlete = Athlete(
-                full_name=result["athlete"],
-                full_name_normalized=normalize_name(result["athlete"]),
-                birth_date=_parse_iso_date(result["birth_date"]),
+                full_name=full_name,
+                full_name_normalized=full_name_normalized,
+                birth_date=birth_date,
                 gender=gender,
                 current_license=license_code,
                 current_license_normalized=license_normalized,
-                athlete_key=athlete_key,
             )
             db.add(athlete)
             db.flush()
         else:
             athlete.gender = athlete.gender or gender
+            if birth_date:
+                if athlete.birth_date is None:
+                    athlete.birth_date = birth_date
+                elif athlete.birth_date != birth_date:
+                    warnings.append(
+                        (
+                            "ATHLETE_BIRTH_DATE_CONFLICT",
+                            f"El atleta ya existe con fecha de nacimiento {athlete.birth_date.isoformat()} y el PDF trae {birth_date.isoformat()}; no se sobrescribe",
+                        )
+                    )
             if license_code:
+                if athlete.current_license_normalized and athlete.current_license_normalized != license_normalized:
+                    warnings.append(
+                        (
+                            "ATHLETE_LICENSE_CHANGED",
+                            f"El atleta ya existe con licencia {athlete.current_license}; se actualiza a {license_code}",
+                        )
+                    )
                 athlete.current_license = license_code
                 athlete.current_license_normalized = license_normalized
-        return athlete
+        return athlete, warnings
 
     def _get_or_create_athlete_license(
         self,
@@ -372,6 +405,10 @@ class PdfResultsImportService:
             query = query.where(Result.athlete_id == athlete.id)
         else:
             query = query.where(Result.athlete_id.is_(None))
+            if result.get("dorsal") is None:
+                query = query.where(Result.bib_number.is_(None))
+            else:
+                query = query.where(Result.bib_number == result.get("dorsal"))
             if club:
                 query = query.where(Result.club_id == club.id)
         if result.get("position") is None:
@@ -595,6 +632,8 @@ def _event_type_lookup_keys(event_name_normalized: str | None) -> list[str]:
     if not event_name_normalized:
         return []
     keys = [event_name_normalized]
+    if re.fullmatch(r"\d{1,3}(?:\.\d{3})+m", event_name_normalized):
+        keys.append(event_name_normalized.replace(".", ""))
     relay_match = re.fullmatch(r"\d+x\d+m?", event_name_normalized)
     if relay_match:
         if event_name_normalized.endswith("m"):

@@ -116,14 +116,13 @@ CREATE TABLE athletes (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
   full_name VARCHAR(255) NOT NULL,
   full_name_normalized VARCHAR(255) NOT NULL,
-  birth_date DATE NOT NULL,
+  birth_date DATE NULL,
   gender ENUM('M','F') NULL,
   current_license VARCHAR(100) NULL,
   current_license_normalized VARCHAR(100) NULL,
-  athlete_key VARCHAR(350) NOT NULL COMMENT 'Clave natural generada por Python: full_name_normalized|YYYY-MM-DD',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  UNIQUE KEY uk_athletes_athlete_key (athlete_key),
+  UNIQUE KEY uk_athletes_full_name_normalized (full_name_normalized),
   KEY idx_athletes_name_birth (full_name_normalized, birth_date),
   KEY idx_athletes_current_license (current_license_normalized)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
