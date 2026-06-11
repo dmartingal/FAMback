@@ -5,7 +5,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import re
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from athletics_loader.db.models import (
@@ -509,12 +509,12 @@ class PdfResultsImportService:
         lookup_keys = _event_type_lookup_keys(event_name_normalized)
 
         for lookup_key in lookup_keys:
-            row = db.scalar(select(EventType).where(EventType.name_normalized == lookup_key))
+            row = db.scalar(select(EventType).where(func.lower(EventType.name_normalized) == lookup_key.lower()))
             if row:
                 return row.id
 
         for lookup_key in lookup_keys:
-            alias = db.scalar(select(EventTypeAlias).where(EventTypeAlias.alias_normalized == lookup_key))
+            alias = db.scalar(select(EventTypeAlias).where(func.lower(EventTypeAlias.alias_normalized) == lookup_key.lower()))
             if alias:
                 return alias.event_type_id
 
@@ -631,15 +631,71 @@ def _db_normalized(value: str | None) -> str | None:
 def _event_type_lookup_keys(event_name_normalized: str | None) -> list[str]:
     if not event_name_normalized:
         return []
-    keys = [event_name_normalized]
-    if re.fullmatch(r"\d{1,3}(?:\.\d{3})+m", event_name_normalized):
-        keys.append(event_name_normalized.replace(".", ""))
-    relay_match = re.fullmatch(r"\d+x\d+m?", event_name_normalized)
-    if relay_match:
-        if event_name_normalized.endswith("m"):
-            keys.append(event_name_normalized[:-1])
-        else:
-            keys.append(f"{event_name_normalized}m")
+    clean_event_name = _strip_trailing_event_type_separator(event_name_normalized)
+    keys = _unique_preserve_order(
+        [
+            event_name_normalized,
+            clean_event_name,
+            _compact_event_type_spacing(clean_event_name),
+            _compact_hurdles_event_name(clean_event_name),
+            _compact_hurdles_event_name(_compact_event_type_spacing(clean_event_name)),
+        ]
+    )
+    for lookup_key in list(keys):
+        if re.fullmatch(r"\d{1,3}(?:\.\d{3})+m", lookup_key):
+            keys.append(lookup_key.replace(".", ""))
+        relay_match = re.fullmatch(r"\d+x\d+m?", lookup_key)
+        if relay_match:
+            if lookup_key.endswith("m"):
+                keys.append(lookup_key[:-1])
+            else:
+                keys.append(f"{lookup_key}m")
+    return _unique_preserve_order(keys)
+
+
+def _strip_trailing_event_type_separator(value: str) -> str:
+    return re.sub(r"\s*[-:|]+\s*$", "", value.strip())
+
+
+def _compact_event_type_spacing(value: str) -> str:
+    compacted = value.strip()
+    compacted = re.sub(r"\s+", " ", compacted)
+    compacted = re.sub(r"\s*\(\s*", "(", compacted)
+    compacted = re.sub(r"\s*\)\s*", ")", compacted)
+    compacted = re.sub(
+        r"\((\d+(?:[.,]\d+)?)\s*(kg|g)\)",
+        lambda match: f"({_decimal_text(match.group(1))}{match.group(2)})",
+        compacted,
+        flags=re.IGNORECASE,
+    )
+    compacted = re.sub(
+        r"\((\d+(?:[.,]\d+)?)\)",
+        lambda match: f"({_decimal_text(match.group(1))})",
+        compacted,
+    )
+    compacted = re.sub(r"\b(\d+(?:[.,]\d+)?)\s*m\b", lambda match: f"{_decimal_text(match.group(1))}m", compacted)
+    return compacted
+
+
+def _compact_hurdles_event_name(value: str) -> str:
+    compacted = _compact_event_type_spacing(value)
+    compacted = re.sub(r"\b(\d+)m\s+vallas\b", r"\1mv", compacted)
+    compacted = re.sub(r"\b(\d+)m\s+v\b", r"\1mv", compacted)
+    return compacted
+
+
+def _decimal_text(value: str) -> str:
+    return value.replace(",", ".")
+
+
+def _unique_preserve_order(values: list[str | None]) -> list[str]:
+    keys = []
+    seen = set()
+    for value in values:
+        if not value or value in seen:
+            continue
+        keys.append(value)
+        seen.add(value)
     return keys
 
 

@@ -14,7 +14,7 @@ DATE_EVENT_HEADER = re.compile(r"^(?P<date>\d{2}/\d{2}/\d{4})\s+(?P<name>.+)$")
 INLINE_EVENT_HEADER = re.compile(r"^(?P<time>\d{2}:\d{2})\s+(?P<date>\d{2}/\d{2}/\d{4})\s+(?P<name>.+)$")
 WIND = re.compile(r"^Viento:\s*(?P<wind>[+-]?\d+(?:[.,]\d+)?)$", re.IGNORECASE)
 ACTA_ROUND = re.compile(
-    r"^(?P<round>(?:Serie\s+\d+)|(?:Semifinal(?:\s+(?:\d+|[A-Z]))?)|(?:Final(?:\s+[A-Z])?))\s+"
+    r"^(?P<round>(?:Serie\s+\d+)|(?:Grupo(?:\s+[A-Z0-9]+)?)|(?:Semifinal(?:\s+(?:\d+|[A-Z]))?)|(?:Final(?:\s+[A-Z])?))\s+"
     r"(?P<date>\d{2}/\d{2}/\d{4})\s+(?P<time>\d{2}:\d{2})$",
     re.IGNORECASE,
 )
@@ -34,11 +34,14 @@ STATUS_MAP = {
     "SM": "NM",
     "DNF": "DNF",
     "DQ": "DQ",
+    "DS": "DQ",
+    "AB": "DNF",
 }
 
 RELAY_EVENT_NAME = re.compile(r"^\d+x\d+m?$", re.IGNORECASE)
 RELAY_MARK = re.compile(r"^(?:\d{1,2}:\d{2}(?:[.,]\d+)?|\d{1,2}[.,]\d+)-?$")
 FIELD_EVENT_TERMS = ("LONGITUD", "TRIPLE", "PESO", "JABALINA", "DISCO", "MARTILLO")
+COMBINED_EVENT_NAMES = {"DECATLON", "HEPTATLON", "HEXATLON", "OCTATLON", "PENTATLON"}
 
 SPANISH_MONTHS = {
     "ene": 1,
@@ -328,20 +331,76 @@ class FamResultsParser(BasePdfParser):
 
     def _parse_acta_events(self, page_lines: list[dict]) -> list[dict]:
         events = []
-        title_indexes = [index for index in range(len(page_lines)) if self._is_acta_event_title(page_lines, index)]
-        blocks: list[list[dict]] = []
-        for position, start in enumerate(title_indexes):
-            end = title_indexes[position + 1] if position + 1 < len(title_indexes) else len(page_lines)
+        title_indexes = []
+        combined_context_by_start: dict[int, dict | None] = {}
+        current_combined: dict | None = None
+
+        for index in range(len(page_lines)):
+            combined_descriptor = self._parse_combined_event_header(page_lines[index]["text"])
+            if combined_descriptor:
+                current_combined = combined_descriptor
+                title_indexes.append(index)
+                combined_context_by_start[index] = current_combined
+                continue
+            if self._is_acta_event_title(page_lines, index):
+                title_indexes.append(index)
+                combined_context_by_start[index] = current_combined
+
+        ordered_title_indexes = sorted(set(title_indexes))
+        blocks: list[dict] = []
+        for position, start in enumerate(ordered_title_indexes):
+            end = ordered_title_indexes[position + 1] if position + 1 < len(ordered_title_indexes) else len(page_lines)
             block = page_lines[start:end]
             if not block:
                 continue
-            if blocks and _acta_event_signature(blocks[-1]) == _acta_event_signature(block):
-                blocks[-1].extend(_strip_repeated_acta_event_header(block))
+            is_combined_header = self._parse_combined_event_header(block[0]["text"]) is not None
+            entry = {
+                "start": start,
+                "block": block,
+                "combined_context": combined_context_by_start.get(start),
+                "is_combined_header": is_combined_header,
+            }
+            if (
+                blocks
+                and not is_combined_header
+                and not blocks[-1]["is_combined_header"]
+                and _combined_context_key(blocks[-1].get("combined_context")) == _combined_context_key(entry.get("combined_context"))
+                and _acta_event_signature(blocks[-1]["block"]) == _acta_event_signature(block)
+            ):
+                blocks[-1]["block"].extend(_strip_repeated_acta_event_header(block))
             else:
-                blocks.append(block)
+                blocks.append(entry)
 
-        for block in blocks:
-            events.extend(self._parse_acta_event_block(block))
+        previous_results_by_combined: dict[tuple[str | None, str | None, str | None], dict] = {}
+        last_event_by_combined: dict[tuple[str | None, str | None, str | None], dict] = {}
+        for entry in blocks:
+            block = entry["block"]
+            combined_descriptor = self._parse_combined_event_header(block[0]["text"])
+            if combined_descriptor:
+                combined_key = _combined_context_key(combined_descriptor)
+                summary_event = self._parse_acta_combined_summary_block(
+                    block,
+                    combined_descriptor,
+                    previous_results_by_combined.get(combined_key, {}),
+                    last_event_by_combined.get(combined_key),
+                )
+                if summary_event:
+                    events.append(summary_event)
+                continue
+
+            combined_context = entry.get("combined_context")
+            parsed_events = self._parse_acta_event_block(block, combined_context)
+            events.extend(parsed_events)
+            if combined_context:
+                combined_key = _combined_context_key(combined_context)
+                lookup = previous_results_by_combined.setdefault(
+                    combined_key,
+                    {"by_license": {}, "by_dorsal": {}, "events_by_license": {}, "events_by_dorsal": {}},
+                )
+                for event in parsed_events:
+                    last_event_by_combined[combined_key] = event
+                    for result in event.get("results", []):
+                        _index_combined_result(lookup, event, result)
         return events
 
     def _is_acta_event_title(self, lines: list[dict], index: int) -> bool:
@@ -359,7 +418,7 @@ class FamResultsParser(BasePdfParser):
                 return True
         return False
 
-    def _parse_acta_event_block(self, block: list[dict]) -> list[dict]:
+    def _parse_acta_event_block(self, block: list[dict], combined_context: dict | None = None) -> list[dict]:
         if not block:
             return []
         descriptor = self._parse_event_descriptor(block[0]["text"])
@@ -371,6 +430,8 @@ class FamResultsParser(BasePdfParser):
         attempt_headers = self._parse_acta_attempt_headers(table_header)
         event_type = self._detect_event_type(descriptor["event_name"], attempt_headers)
         has_rt_column = _has_rt_column(table_header)
+        header_text = " ".join(item["text"] for item in block[: _first_acta_round_index(block) or len(block)])
+        has_points_column = _has_points_column(header_text, table_header)
 
         round_indexes = [index for index, item in enumerate(block) if ACTA_ROUND.match(item["text"])]
         events = []
@@ -391,6 +452,9 @@ class FamResultsParser(BasePdfParser):
             event["attempt_headers"] = attempt_headers
             event["event_type"] = event_type
             event["has_rt_column"] = has_rt_column
+            event["has_points_column"] = has_points_column
+            if combined_context:
+                event["combined_event"] = _combined_context_payload(combined_context)
             event["round_type"] = self._round_type(round_name)
             event["results"], event["unparsed_lines"] = self._parse_acta_rows(
                 block[round_index + 1:next_round_index],
@@ -399,6 +463,107 @@ class FamResultsParser(BasePdfParser):
             )
             events.append(event)
         return events
+
+    def _parse_combined_event_header(self, line: str) -> dict | None:
+        for candidate in (line, _collapse_overlay_text(line)):
+            descriptor = self._parse_event_descriptor(candidate)
+            if _is_combined_event_name(descriptor.get("event_name")) and descriptor.get("sex"):
+                return descriptor
+        return None
+
+    def _parse_acta_combined_summary_block(
+        self,
+        block: list[dict],
+        combined_descriptor: dict,
+        previous_results_lookup: dict,
+        last_event: dict | None,
+    ) -> dict | None:
+        if not last_event:
+            return None
+        header_index = _find_combined_summary_header_index(block)
+        if header_index is None:
+            return None
+
+        event_date = _parse_iso_date(last_event["date"])
+        event_time = last_event.get("time") or "00:00"
+        event = self._new_event(
+            descriptor={**combined_descriptor, "round_name": "Final"},
+            event_date=event_date,
+            event_time=event_time,
+            page_number=block[0]["page_number"],
+            raw_header_text=block[0]["text"],
+        )
+        event["event_type"] = "combined"
+        event["round_type"] = "FINAL"
+        event["combined_event"] = _combined_context_payload(combined_descriptor)
+        event["combined_summary_headers"] = _parse_combined_summary_headers(block[header_index]["text"])
+
+        results, unparsed = self._parse_acta_combined_summary_rows(
+            block[header_index + 1:],
+            event,
+            previous_results_lookup,
+        )
+        if not results:
+            return None
+        event["results"] = results
+        event["unparsed_lines"] = unparsed
+        return event
+
+    def _parse_acta_combined_summary_rows(
+        self,
+        lines: list[dict],
+        event: dict,
+        previous_results_lookup: dict,
+    ) -> tuple[list[dict], list[str]]:
+        results = []
+        unparsed = []
+        index = 0
+        while index < len(lines):
+            line = lines[index]["text"]
+            if self._skip_line(line):
+                index += 1
+                continue
+            if line.startswith("#"):
+                event["notes"].append(line)
+                index += 1
+                continue
+
+            first = _parse_combined_summary_result_line(line)
+            if not first:
+                if not _looks_like_combined_partial_points_line(line):
+                    unparsed.append(line)
+                index += 1
+                continue
+
+            tail = {}
+            raw_lines = [line]
+            consumed = 1
+            if index + 1 < len(lines):
+                tail = self._parse_club_license(lines[index + 1]["text"])
+                raw_lines.append(lines[index + 1]["text"])
+                consumed += 1
+
+            _merge_combined_summary_lookup(first, tail, previous_results_lookup)
+
+            partial_points = None
+            if index + consumed < len(lines):
+                partial_points = _parse_combined_partial_points(
+                    lines[index + consumed]["text"],
+                    event.get("combined_summary_headers", []),
+                )
+                if partial_points:
+                    raw_lines.append(lines[index + consumed]["text"])
+                    consumed += 1
+            partial_points = _combined_partial_points_from_lookup(first, tail, previous_results_lookup) or partial_points
+
+            mark_info = self._parse_mark_and_attempts([first["total_points"]], [], event["event_type"])
+            first.update(mark_info)
+            result = self._build_result(event, first, tail, raw_lines=raw_lines)
+            if partial_points:
+                result["combined_partial_points"] = partial_points
+            results.append(result)
+            index += consumed
+        return results, unparsed
 
     def _parse_acta_rows(self, lines: list[dict], event: dict, table_header: str) -> tuple[list[dict], list[str]]:
         results = []
@@ -446,6 +611,7 @@ class FamResultsParser(BasePdfParser):
                 table_header,
                 event["event_name"],
                 event.get("has_rt_column", False),
+                event.get("has_points_column", False),
             )
             if not first:
                 unparsed.append(line)
@@ -549,11 +715,13 @@ class FamResultsParser(BasePdfParser):
 
     def _parse_acta_attempt_headers(self, table_header: str) -> list[str]:
         content = re.sub(r"^Pto\s+Dor\s*", "", table_header).strip()
-        content = re.sub(r"\b(Calle|Orden|Marca|Resultado|Intentos|Puntos?|RT)\b", "", content).strip()
+        content = re.sub(r"\b(Nombre|F\s+de\s+Nac|F|de|Nac|Cat|Calle|Orden|Marca|Resultado|Intentos|Puntos?|Ptos|RT)\b", "", content).strip()
         return content.split() if content else []
 
     def _detect_event_type(self, event_name: str, attempt_headers: list[str]) -> str:
         normalized = normalize_name(event_name)
+        if _is_combined_event_name(event_name):
+            return "combined"
         if RELAY_EVENT_NAME.match(_normalize_event_name(event_name)):
             return "relay"
         if "ALTURA" in normalized or "PERTIGA" in normalized:
@@ -566,18 +734,23 @@ class FamResultsParser(BasePdfParser):
 
     def _parse_relay_result_line(self, line: str, table_header: str) -> dict | None:
         tokens = line.split()
-        if len(tokens) < 3 or not tokens[0].isdigit():
+        if len(tokens) < 3:
             return None
 
         mark_index = _find_relay_mark_index(tokens)
-        if mark_index is None or mark_index <= 1:
+        if mark_index is None:
             return None
 
+        position = None
         lane = None
-        club_start = 1
-        if "Calle" in table_header and tokens[1].isdigit():
+        club_start = 0
+        if tokens[0].isdigit():
+            position = int(tokens[0])
+            club_start = 1
+
+        if "Calle" in table_header and len(tokens) > club_start and tokens[club_start].isdigit():
             lane = _to_int(tokens[1])
-            club_start = 2
+            club_start += 1
 
         club_end = mark_index
         if lane is None and mark_index > club_start and tokens[mark_index - 1].isdigit():
@@ -588,9 +761,11 @@ class FamResultsParser(BasePdfParser):
         if not club_tokens:
             return None
 
-        mark_info = self._parse_mark_and_attempts([_clean_relay_mark(tokens[mark_index])], [], "relay")
+        mark_info = self._parse_mark_and_attempts(
+            [_clean_relay_mark(value) for value in tokens[mark_index:]], [], "relay"
+        )
         return {
-            "position": int(tokens[0]),
+            "position": position,
             "dorsal": None,
             "athlete": "",
             "club": " ".join(club_tokens),
@@ -637,6 +812,7 @@ class FamResultsParser(BasePdfParser):
         table_header: str,
         event_name: str | None = None,
         has_rt_column: bool = False,
+        has_points_column: bool = False,
     ) -> dict | None:
         tokens = line.split()
         birth_index = _find_birth_date_index(tokens)
@@ -647,10 +823,14 @@ class FamResultsParser(BasePdfParser):
         if not prefix:
             return None
         athlete_tokens = tokens[prefix["next_index"]:birth_index]
-        birth_date = _parse_loose_date(tokens[birth_index])
+        birth_date, birth_mark_suffix = _parse_birth_date_with_attached_suffix(tokens[birth_index])
         values = tokens[birth_index + 1:]
+        if birth_mark_suffix:
+            values = [birth_mark_suffix, *values]
         if not values:
             return None
+        if _acta_table_has_category(table_header) and values and _looks_like_acta_category_token(values[0]):
+            values = values[1:]
 
         lane = None
         order_number = None
@@ -661,8 +841,12 @@ class FamResultsParser(BasePdfParser):
             order_number = _to_int(values[0])
             values = values[1:]
 
+        combined_points = None
+        if event_name and has_points_column:
+            values, combined_points = _extract_combined_result_points(values)
+
         mark_info = self._parse_mark_and_attempts(values, attempt_headers, event_type, event_name, has_rt_column)
-        return {
+        parsed = {
             "position": prefix["position"],
             "dorsal": prefix["dorsal"],
             "athlete": " ".join(athlete_tokens),
@@ -671,6 +855,9 @@ class FamResultsParser(BasePdfParser):
             "order_number": order_number,
             **mark_info,
         }
+        if combined_points:
+            parsed["combined_points"] = combined_points
+        return parsed
 
     def _parse_fam_tail(self, line: str, tail_mode: str | None) -> dict:
         if tail_mode == "fn":
@@ -691,7 +878,15 @@ class FamResultsParser(BasePdfParser):
         license_index = _find_license_index(tokens, from_right=True)
         if license_index is None:
             return {"club": line, "license": None}
-        return {"club": " ".join(tokens[:license_index]), "license": tokens[license_index]}
+        tail_tokens = tokens[license_index + 1:]
+        combined_accumulated_points = None
+        if tail_tokens and _looks_like_combined_points_total(tail_tokens[-1]):
+            combined_accumulated_points = _normalize_points_mark(tail_tokens[-1])
+        return {
+            "club": " ".join(tokens[:license_index]),
+            "license": tokens[license_index],
+            "combined_accumulated_points": combined_accumulated_points,
+        }
 
     def _build_result(self, event: dict, first: dict, tail: dict, raw_lines: list[str]) -> dict:
         birth_date = first.get("birth_date") or tail.get("birth_date")
@@ -703,6 +898,7 @@ class FamResultsParser(BasePdfParser):
         cleaned_raw_lines = _clean_result_raw_lines(
             raw_lines,
             event["event_type"],
+            event.get("event_name"),
             event.get("has_rt_column", False),
         )
         return {
@@ -723,8 +919,11 @@ class FamResultsParser(BasePdfParser):
             "wind": event.get("wind"),
             "attempts": first.get("attempts", []),
             "raw_text": "\n".join(cleaned_raw_lines),
-            "parse_warnings": _rt_parse_warnings(raw_lines, cleaned_raw_lines, event["event_type"]),
+            "parse_warnings": _rt_parse_warnings(raw_lines, cleaned_raw_lines, event["event_type"], event.get("event_name")),
             "relay_group": first.get("relay_group"),
+            "combined_event": event.get("combined_event"),
+            "combined_points": first.get("combined_points"),
+            "combined_accumulated_points": tail.get("combined_accumulated_points"),
         }
 
     def _parse_mark_and_attempts(
@@ -736,7 +935,7 @@ class FamResultsParser(BasePdfParser):
         has_rt_column: bool = False,
     ) -> dict:
         raw_values = _remove_rt_column_or_tokens_if_present(raw_values, event_type, has_rt_column)
-        raw_values = _remove_result_annotation_suffixes(raw_values)
+        raw_values = _remove_result_annotation_suffixes(raw_values, event_type, event_name)
         raw_values = _remove_race_qualification_suffixes(raw_values, event_type)
         raw_values = _without_team_points(raw_values, attempt_headers, event_type)
         if not raw_values:
@@ -843,6 +1042,7 @@ class FamResultsParser(BasePdfParser):
                 "ACTA DEL CAMPEONATO",
             }
             or SPANISH_DATE_LINE.match(line)
+            or _looks_like_venue_date_range(line)
             or line.startswith("Pto. Puesto")
             or re.match(r"^(DNS|DQ|DNF|NP|NM|SM)\b", line)
             or _looks_like_acta_page_title(line)
@@ -903,6 +1103,14 @@ def _find_birth_date_index(tokens: list[str]) -> int | None:
     return None
 
 
+def _parse_birth_date_with_attached_suffix(value: str) -> tuple[date | None, str | None]:
+    match = re.match(r"^(?P<birth>\d{2}/\d{2}/\d{4})(?P<suffix>.+)$", value.strip())
+    if not match:
+        return _parse_loose_date(value), None
+    suffix = match.group("suffix").strip()
+    return _parse_loose_date(match.group("birth")), suffix or None
+
+
 def _without_team_points(raw_values: list[str], attempt_headers: list[str], event_type: str) -> list[str]:
     if len(raw_values) < 2:
         return raw_values
@@ -935,7 +1143,7 @@ def _without_team_points(raw_values: list[str], attempt_headers: list[str], even
 
 
 def _remove_rt_column_or_tokens_if_present(raw_values: list[str], event_type: str, has_rt_column: bool = False) -> list[str]:
-    if event_type != "race" or not raw_values:
+    if event_type not in {"race", "relay"} or not raw_values:
         return raw_values
     rt_index = next((index for index, value in enumerate(raw_values) if value.upper() == "RT"), None)
     if rt_index is not None:
@@ -954,20 +1162,30 @@ def _remove_race_qualification_suffixes(raw_values: list[str], event_type: str) 
     return values
 
 
-def _clean_result_raw_lines(raw_lines: list[str], event_type: str, has_rt_column: bool = False) -> list[str]:
-    if event_type != "race":
+def _clean_result_raw_lines(
+    raw_lines: list[str],
+    event_type: str,
+    event_name: str | None = None,
+    has_rt_column: bool = False,
+) -> list[str]:
+    if event_type not in {"race", "relay"}:
         return raw_lines
     cleaned_lines = []
     for line in raw_lines:
         tokens = line.split()
         cleaned_tokens = _remove_rt_column_or_tokens_if_present(tokens, event_type, has_rt_column)
-        cleaned_tokens = _remove_result_annotation_suffixes(cleaned_tokens)
+        cleaned_tokens = _remove_result_annotation_suffixes(cleaned_tokens, event_type, event_name)
         cleaned_tokens = _remove_race_qualification_suffixes(cleaned_tokens, event_type)
         cleaned_lines.append(" ".join(cleaned_tokens) if cleaned_tokens != tokens else line)
     return cleaned_lines
 
 
-def _rt_parse_warnings(raw_lines: list[str], cleaned_raw_lines: list[str], event_type: str) -> list[dict]:
+def _rt_parse_warnings(
+    raw_lines: list[str],
+    cleaned_raw_lines: list[str],
+    event_type: str,
+    event_name: str | None = None,
+) -> list[dict]:
     if event_type != "race":
         return []
     warnings = []
@@ -976,7 +1194,7 @@ def _rt_parse_warnings(raw_lines: list[str], cleaned_raw_lines: list[str], event
             continue
         if _removed_only_qualification_suffix(raw_line, cleaned_line):
             continue
-        if _removed_only_result_annotation_suffix(raw_line, cleaned_line):
+        if _removed_only_result_annotation_suffix(raw_line, cleaned_line, event_type, event_name):
             continue
         warnings.append(
             {
@@ -998,25 +1216,102 @@ def _removed_only_qualification_suffix(raw_line: str, cleaned_line: str) -> bool
     )
 
 
-def _remove_result_annotation_suffixes(raw_values: list[str]) -> list[str]:
+def _remove_result_annotation_suffixes(
+    raw_values: list[str],
+    event_type: str | None = None,
+    event_name: str | None = None,
+) -> list[str]:
     values = raw_values
-    while len(values) >= 2 and _is_result_annotation_token(values[-1]):
-        values = values[:-1]
+    while len(values) >= 2:
+        if _is_result_annotation_token(values[-1], event_type, event_name):
+            values = values[:-1]
+            continue
+        if (
+            event_type == "race"
+            and _is_race_walk_event(event_name)
+            and len(values) >= 3
+            and _is_race_walk_rule_prefix_token(values[-2])
+            and _is_rule_number_token(values[-1])
+        ):
+            values = values[:-2]
+            continue
+        break
     return values
 
 
-def _is_result_annotation_token(value: str) -> bool:
-    return bool(re.fullmatch(r"(?:YC|RT\d+(?:\.\d+)*)", value.strip(), re.IGNORECASE))
+def _is_result_annotation_token(
+    value: str,
+    event_type: str | None = None,
+    event_name: str | None = None,
+) -> bool:
+    token = value.strip()
+    if re.fullmatch(r"(?:YC|RT\d+(?:\.\d+)*)", token, re.IGNORECASE):
+        return True
+    return event_type == "race" and _is_race_walk_event(event_name) and _is_race_walk_annotation_token(token)
 
 
-def _removed_only_result_annotation_suffix(raw_line: str, cleaned_line: str) -> bool:
+def _removed_only_result_annotation_suffix(
+    raw_line: str,
+    cleaned_line: str,
+    event_type: str | None = None,
+    event_name: str | None = None,
+) -> bool:
     raw_tokens = raw_line.split()
     cleaned_tokens = cleaned_line.split()
     if len(raw_tokens) <= len(cleaned_tokens):
         return False
-    return raw_tokens[: len(cleaned_tokens)] == cleaned_tokens and all(
-        _is_result_annotation_token(token) for token in raw_tokens[len(cleaned_tokens):]
+    return raw_tokens[: len(cleaned_tokens)] == cleaned_tokens and _removed_suffix_tokens_are_annotations(
+        raw_tokens[len(cleaned_tokens):],
+        event_type,
+        event_name,
     )
+
+
+def _removed_suffix_tokens_are_annotations(
+    tokens: list[str],
+    event_type: str | None = None,
+    event_name: str | None = None,
+) -> bool:
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if _is_result_annotation_token(token, event_type, event_name):
+            index += 1
+            continue
+        if token.upper() == "RT" and index + 1 < len(tokens) and _is_rule_number_token(tokens[index + 1]):
+            index += 2
+            continue
+        if (
+            event_type == "race"
+            and _is_race_walk_event(event_name)
+            and index + 1 < len(tokens)
+            and _is_race_walk_rule_prefix_token(token)
+            and _is_rule_number_token(tokens[index + 1])
+        ):
+            index += 2
+            continue
+        return False
+    return True
+
+
+def _is_race_walk_event(event_name: str | None) -> bool:
+    return "MARCHA" in normalize_name(event_name or "")
+
+
+def _is_race_walk_annotation_token(value: str) -> bool:
+    token = value.strip()
+    return bool(
+        re.fullmatch(r"[>~]{1,3}", token)
+        or re.fullmatch(r"[>~]*(?:RPT|RT)[>~]?\d+(?:\.\d+)+", token, re.IGNORECASE)
+    )
+
+
+def _is_race_walk_rule_prefix_token(value: str) -> bool:
+    return bool(re.fullmatch(r"[>~]*(?:RPT|RT)[>~]*", value.strip(), re.IGNORECASE))
+
+
+def _is_rule_number_token(value: str) -> bool:
+    return bool(re.fullmatch(r"[1-9]\d*(?:\.\d+)+", value.strip()))
 
 
 def _is_400m_event(event_name: str | None) -> bool:
@@ -1094,6 +1389,178 @@ def _parse_acta_descriptor_for_signature(text: str) -> dict:
     }
 
 
+def _combined_context_key(context: dict | None) -> tuple[str | None, str | None, str | None]:
+    if not context:
+        return None, None, None
+    return context.get("event_name"), context.get("category_text"), context.get("sex")
+
+
+def _combined_context_payload(context: dict) -> dict:
+    return {
+        "event_name": context.get("event_name"),
+        "category_text": context.get("category_text"),
+        "sex": context.get("sex"),
+        "raw_name": context.get("raw_name"),
+    }
+
+
+def _index_combined_result(lookup: dict, event: dict, result: dict) -> None:
+    if result.get("license"):
+        lookup.setdefault("by_license", {})[result["license"]] = result
+        lookup.setdefault("events_by_license", {}).setdefault(result["license"], []).append(
+            {"event_name": event.get("event_name"), "points": result.get("combined_points")}
+        )
+    if result.get("dorsal"):
+        lookup.setdefault("by_dorsal", {})[result["dorsal"]] = result
+        lookup.setdefault("events_by_dorsal", {}).setdefault(result["dorsal"], []).append(
+            {"event_name": event.get("event_name"), "points": result.get("combined_points")}
+        )
+
+
+def _collapse_overlay_text(value: str) -> str:
+    return re.sub(r"(.)\1+", r"\1", value)
+
+
+def _is_combined_event_name(event_name: str | None) -> bool:
+    return normalize_name(event_name or "") in COMBINED_EVENT_NAMES
+
+
+def _first_acta_round_index(block: list[dict]) -> int | None:
+    for index, item in enumerate(block):
+        if ACTA_ROUND.match(item["text"]):
+            return index
+    return None
+
+
+def _has_points_column(*headers: str) -> bool:
+    return any(re.search(r"\b(?:Ptos|Puntos?)\b", header, re.IGNORECASE) for header in headers if header)
+
+
+def _acta_table_has_category(table_header: str) -> bool:
+    return bool(re.search(r"\bCat\b", table_header))
+
+
+def _looks_like_acta_category_token(value: str) -> bool:
+    token = value.strip().upper()
+    if _looks_like_result_mark(token):
+        return False
+    return token in {"SM", "SF", "PM", "PF", "JM", "JF"} or bool(re.fullmatch(r"[MF]\d{2,3}|S\d{1,2}|SUB-?\d{1,2}", token))
+
+
+def _extract_combined_result_points(values: list[str]) -> tuple[list[str], str | None]:
+    if len(values) < 2:
+        return values, None
+    points = values[-1]
+    previous = values[-2]
+    if _looks_like_combined_points(points) and (previous.upper() in STATUS_MAP or _looks_like_scored_result_mark(previous)):
+        return values[:-1], _normalize_points_mark(points)
+    return values, None
+
+
+def _find_combined_summary_header_index(block: list[dict]) -> int | None:
+    for index, item in enumerate(block):
+        line = item["text"]
+        if line.startswith("Pto Dor") and "Marca" in line and not ("Calle" in line or "Orden" in line):
+            return index
+    return None
+
+
+def _parse_combined_summary_headers(header: str) -> list[str]:
+    content = re.sub(r"^Pto\s+Dor\s+Cat\s*", "", header).strip()
+    content = re.sub(r"\bMarca\b.*$", "", content).strip()
+    content = content.replace("LongitudPeso", "Longitud Peso")
+    content = content.replace("PesoLongitud", "Peso Longitud")
+    return content.split() if content else []
+
+
+def _parse_combined_summary_result_line(line: str) -> dict | None:
+    tokens = line.split()
+    if len(tokens) < 4:
+        return None
+    total = tokens[-1]
+    if not (_looks_like_combined_points_total(total) or total.upper() in STATUS_MAP):
+        return None
+    birth_index = _find_birth_date_index(tokens)
+    prefix = _parse_position_dorsal(tokens[:birth_index] if birth_index is not None else tokens)
+    if not prefix:
+        return None
+
+    athlete = ""
+    birth_date = None
+    if birth_index is not None:
+        athlete = " ".join(tokens[prefix["next_index"]:birth_index]).strip()
+        parsed_birth_date = _parse_loose_date(tokens[birth_index])
+        birth_date = parsed_birth_date.isoformat() if parsed_birth_date else None
+    return {
+        "position": prefix["position"],
+        "dorsal": prefix["dorsal"],
+        "athlete": athlete,
+        "birth_date": birth_date,
+        "lane": None,
+        "order_number": None,
+        "total_points": _normalize_points_mark(total) if _looks_like_combined_points_total(total) else total,
+    }
+
+
+def _merge_combined_summary_lookup(first: dict, tail: dict, lookup: dict) -> None:
+    previous = None
+    if tail.get("license"):
+        previous = lookup.get("by_license", {}).get(tail["license"])
+    if previous is None and first.get("dorsal"):
+        previous = lookup.get("by_dorsal", {}).get(first["dorsal"])
+    if not previous:
+        return
+    for key in ("athlete", "birth_date", "category_text"):
+        if previous.get(key):
+            first[key] = previous[key]
+    if previous.get("club") and not tail.get("club"):
+        tail["club"] = previous["club"]
+    if previous.get("license") and not tail.get("license"):
+        tail["license"] = previous["license"]
+
+
+def _combined_partial_points_from_lookup(first: dict, tail: dict, lookup: dict) -> dict | None:
+    events = None
+    if tail.get("license"):
+        events = lookup.get("events_by_license", {}).get(tail["license"])
+    if events is None and first.get("dorsal"):
+        events = lookup.get("events_by_dorsal", {}).get(first["dorsal"])
+    if not events:
+        return None
+    partial_points = {
+        item["event_name"]: item["points"]
+        for item in events
+        if item.get("event_name") and item.get("points")
+    }
+    return partial_points or None
+
+
+def _looks_like_combined_partial_points_line(line: str) -> bool:
+    tokens = line.split()
+    return bool(tokens) and all(_looks_like_combined_points(token) for token in tokens)
+
+
+def _parse_combined_partial_points(line: str, headers: list[str]) -> dict | None:
+    if not _looks_like_combined_partial_points_line(line):
+        return None
+    values = [_normalize_points_mark(token) for token in line.split()]
+    if headers:
+        return {header: value for header, value in zip(headers, values)}
+    return {str(index): value for index, value in enumerate(values, start=1)}
+
+
+def _looks_like_combined_points(value: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,4}", value.strip()))
+
+
+def _looks_like_combined_points_total(value: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,2}(?:\.\d{3})+|\d{3,5}", value.strip()))
+
+
+def _normalize_points_mark(value: str) -> str:
+    return value.replace(".", "")
+
+
 def _strip_repeated_acta_event_header(block: list[dict]) -> list[dict]:
     stripped = []
     for index, item in enumerate(block):
@@ -1121,15 +1588,20 @@ def _looks_like_acta_page_title(line: str) -> bool:
             normalized.startswith("CAMPEONATO ")
             or normalized.startswith("CTO ")
             or normalized.startswith("CAMP. ")
+            or normalized.startswith("CONTROL ")
             or normalized.startswith("REUNION ")
             or normalized.startswith("JORNADA ")
         )
     )
 
 
+def _looks_like_venue_date_range(line: str) -> bool:
+    return bool(re.match(r"^.+,\s*\d{1,2}(?:-\d{1,2})?\s+[A-Za-z]+\s+\d{4}$", line.strip()))
+
+
 def _is_acta_round_heading(line: str) -> bool:
     normalized = normalize_name(line.strip())
-    return normalized in {"FINAL", "SEMIFINAL"}
+    return normalized in {"FINAL", "SEMIFINAL", "GRUPO"}
 
 
 def _is_acta_results_header_line(line: str) -> bool:
@@ -1139,6 +1611,8 @@ def _is_acta_results_header_line(line: str) -> bool:
 def _find_relay_mark_index(tokens: list[str]) -> int | None:
     for index in range(len(tokens) - 1, 0, -1):
         token = tokens[index].strip()
+        if RELAY_MARK.match(token) and index > 0 and tokens[index - 1].upper() in {"RT", "RPT"}:
+            continue
         if token.upper() in STATUS_MAP or RELAY_MARK.match(token):
             return index
     return None
@@ -1146,21 +1620,23 @@ def _find_relay_mark_index(tokens: list[str]) -> int | None:
 
 def _parse_relay_member_line(line: str) -> dict | None:
     tokens = line.split()
-    if len(tokens) < 4 or not tokens[0].isdigit():
+    if len(tokens) < 3:
         return None
     birth_index = _find_birth_date_index(tokens)
     license_index = _find_license_index(tokens, from_right=True)
     if birth_index is None or license_index is None or license_index <= birth_index:
         return None
     birth_date = _parse_loose_date(tokens[birth_index])
-    athlete_tokens = tokens[1:birth_index]
+    bib_number = tokens[0] if tokens[0].isdigit() else None
+    athlete_start = 1 if bib_number else 0
+    athlete_tokens = tokens[athlete_start:birth_index]
     if athlete_tokens and athlete_tokens[0].lower() == "(f)":
         athlete_tokens = athlete_tokens[1:]
     athlete_name = " ".join(athlete_tokens).strip()
     if not athlete_name:
         return None
     return {
-        "bib_number": tokens[0],
+        "bib_number": bib_number,
         "athlete_name": athlete_name,
         "birth_date": birth_date.isoformat() if birth_date else None,
         "license": tokens[license_index],
@@ -1174,6 +1650,7 @@ def _clean_relay_mark(value: str) -> str:
 
 def _normalize_event_name(event_name: str) -> str:
     value = re.sub(r"\s+", " ", event_name).strip()
+    value = re.sub(r"\bVET\b.*$", "", value, flags=re.IGNORECASE).strip()
     return value
 
 

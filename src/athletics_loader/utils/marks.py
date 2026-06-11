@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
 import re
+import unicodedata
 
 
 SECONDS_MARK = re.compile(r"^(?:(?P<minutes>\d+):)?(?P<seconds>\d{1,2})(?:[.,](?P<fraction>\d+))?$")
@@ -37,9 +38,17 @@ def infer_mark_unit(event_name: str | None, mark: str | None) -> str:
         return "none"
     if mark.upper() in {"DNS", "NP", "NM", "SM", "DNF", "DQ"}:
         return "none"
-    normalized_event = (event_name or "").lower()
-    if any(term in normalized_event for term in ("altura", "longitud", "triple", "peso", "jabalina", "disco", "martillo", "pértiga", "pertiga")):
+    normalized_event = _normalize_event_name(event_name)
+    if any(term in normalized_event for term in ("decatlon", "heptatlon", "hexatlon", "octatlon", "pentatlon")):
+        return "points"
+    if any(term in normalized_event for term in ("altura", "longitud", "triple", "peso", "jabalina", "disco", "martillo", "pertiga")):
         return "meters"
     if ":" in mark or re.match(r"^\d{1,2}[.,]\d+$", mark):
         return "seconds"
     return "text"
+
+
+def _normalize_event_name(event_name: str | None) -> str:
+    value = unicodedata.normalize("NFKD", event_name or "")
+    value = "".join(c for c in value if not unicodedata.combining(c))
+    return value.lower()

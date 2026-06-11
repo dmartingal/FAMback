@@ -24,8 +24,30 @@ def test_event_type_lookup_keys_accepts_thousands_separator_in_distance() -> Non
     assert _event_type_lookup_keys("1.000m") == ["1.000m", "1000m"]
 
 
-def test_event_type_lookup_keys_does_not_strip_implement_decimals() -> None:
-    assert _event_type_lookup_keys("60m vallas (0.762)") == ["60m vallas (0.762)"]
+def test_event_type_lookup_keys_compacts_implement_spacing_and_decimal_comma() -> None:
+    assert _event_type_lookup_keys("peso (6 kg)") == ["peso (6 kg)", "peso(6kg)"]
+    assert _event_type_lookup_keys("peso (7,260 kg)") == ["peso (7,260 kg)", "peso(7.260kg)"]
+
+
+def test_event_type_lookup_keys_compacts_hurdles_spacing_and_decimal_comma() -> None:
+    assert _event_type_lookup_keys("60m vallas (0,762)") == [
+        "60m vallas (0,762)",
+        "60m vallas(0.762)",
+        "60mv(0.762)",
+    ]
+
+
+def test_event_type_lookup_keys_ignores_trailing_separator_from_pdf_header() -> None:
+    assert _event_type_lookup_keys("60m vallas (0,91) -") == [
+        "60m vallas (0,91) -",
+        "60m vallas (0,91)",
+        "60m vallas(0.91)",
+        "60mv(0.91)",
+    ]
+
+
+def test_event_type_lookup_keys_compacts_distance_spacing_without_alias() -> None:
+    assert _event_type_lookup_keys("1.000 m") == ["1.000 m", "1.000m", "1000m"]
 
 
 def test_get_or_create_athlete_creates_without_birth_date() -> None:

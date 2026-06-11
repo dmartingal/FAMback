@@ -1,5 +1,6 @@
 from pathlib import Path
 from athletics_loader.pdf.parsers.fam_results_parser import FamResultsParser
+from athletics_loader.utils.marks import infer_mark_unit, parse_mark_numeric
 
 
 def test_fam_parser_detects_header() -> None:
@@ -271,6 +272,65 @@ Club C M103"""
     assert [parsed_result["mark"] for parsed_result in event["results"]] == ["9.48", "9.49", "9.50"]
     assert all(parsed_result["attempts"] == [] for parsed_result in event["results"])
     assert all("RT" not in parsed_result["raw_text"].upper() for parsed_result in event["results"])
+    assert all(parsed_result["parse_warnings"] == [] for parsed_result in event["results"])
+
+
+def test_fam_parser_ignores_race_walk_fault_symbols_after_mark() -> None:
+    parser = FamResultsParser()
+    pages = [
+        """Campeonato de Madrid de Marcha Master
+Madrid-Gallur, 10 enero 2026
+ACTA DEL CAMPEONATO
+3.000m Marcha Master Masc 55-59
+Pto Dor Marca
+Final 10/01/2026 11:18
+1 163 Juan Manuel De Lucas Pasalodos 29/06/196614:56.09 ~
+Atletismo Leganes M24
+2 39 Jose Antonio Santamaria Ugarte 25/06/196919:11.06 >
+A.D. Sprint M10155
+3 1120 Mario Fernandez Revilla 29/11/196819:44.37 >>
+Spartak Getafe M880"""
+    ]
+
+    result = parser.parse(Path("race-walk-faults.pdf"), pages)
+
+    event = result["events"][0]
+    assert event["event_name"] == "3.000m Marcha"
+    assert [parsed_result["mark"] for parsed_result in event["results"]] == ["14:56.09", "19:11.06", "19:44.37"]
+    assert all(parsed_result["attempts"] == [] for parsed_result in event["results"])
+    assert all(">" not in parsed_result["raw_text"] for parsed_result in event["results"])
+    assert all("~" not in parsed_result["raw_text"] for parsed_result in event["results"])
+    assert all(parsed_result["parse_warnings"] == [] for parsed_result in event["results"])
+
+
+def test_fam_parser_keeps_ds_status_for_race_walk_disqualification_annotation() -> None:
+    parser = FamResultsParser()
+    pages = [
+        """Campeonato de Madrid de Marcha Master
+Madrid-Gallur, 10 enero 2026
+ACTA DEL CAMPEONATO
+3.000m Marcha Master Fem 65-69
+Pto Dor Marca
+Final 10/01/2026 10:55
+769 Azucena Lopez Almorox 25/02/1958 DS >>>RPT>54.7.5
+Canguro A.A.C. M963
+290 Yeray Hernan Tudela 06/02/1981 DS >~>RPT~54.7.5
+Atletismo Alcorcon M14248
+291 Ana Otra Atleta 06/02/1981 DS RT 54.7.5
+Atletismo Alcorcon M14249
+292 Alba Marchadora 06/02/1981 DS >>>RPT> 54.7.5
+Atletismo Alcorcon M14249"""
+    ]
+
+    result = parser.parse(Path("race-walk-disqualified.pdf"), pages)
+
+    event = result["events"][0]
+    assert [parsed_result["dorsal"] for parsed_result in event["results"]] == ["769", "290", "291", "292"]
+    assert all(parsed_result["mark"] is None for parsed_result in event["results"])
+    assert all(parsed_result["status"] == "DQ" for parsed_result in event["results"])
+    assert all(parsed_result["status_original"] == "DS" for parsed_result in event["results"])
+    assert all("RPT" not in parsed_result["raw_text"] for parsed_result in event["results"])
+    assert all("54.7.5" not in parsed_result["raw_text"] for parsed_result in event["results"])
     assert all(parsed_result["parse_warnings"] == [] for parsed_result in event["results"])
 
 
@@ -688,6 +748,146 @@ Colmenar Viejo M6134
     assert event["results"][0]["attempts"][1]["attempt_value_raw"] == "XO"
 
 
+def test_fam_parser_parses_combined_individual_events_and_summary_points() -> None:
+    parser = FamResultsParser()
+    pages = [
+        """Campeonato de Madrid de Pruebas Combinadas
+Madrid-Gallur, 17-18 enero 2026
+ACTA DEL CAMPEONATO
+Heptatlón Abs Masc
+60m Abs Masc
+Nombre F de Nac Ptos
+Pto Dor Cat Calle Marca
+Club Lic Acum.
+Serie 1 17/01/2026 15:30
+1 101 Mario Prueba Uno 01/01/2000 SM 4 7.36 759
+Club Uno M101 759
+Longitud Abs Masc
+Nombre F de Nac Ptos
+Pto Dor Cat 1 2 3 Marca
+Club Lic Acum.
+Grupo 17/01/2026 15:50
+1 101 Mario Prueba Uno 01/01/2000 SM 6.08 4.96 6.42 6.42 679
+Club Uno M101 1.438
+Heptatlón Abs Masc
+Nombre F de Nac
+Pto Dor Cat 60 Longitud Marca
+Club Lic
+1 101 Mario Prueba Uno 01/01/2000 SM 7.36 6.42 1.438
+Club Uno M101
+759 679"""
+    ]
+
+    result = parser.parse(Path("combined-heptathlon.pdf"), pages)
+
+    race = next(event for event in result["events"] if event["event_name"] == "60m")
+    field = next(event for event in result["events"] if event["event_name"] == "Longitud")
+    combined = next(event for event in result["events"] if event["event_name"] == "Heptatlón")
+
+    assert race["event_type"] == "race"
+    assert race["combined_event"]["event_name"] == "Heptatlón"
+    assert race["results"][0]["mark"] == "7.36"
+    assert race["results"][0]["lane"] == 4
+    assert race["results"][0]["combined_points"] == "759"
+    assert field["event_type"] == "field"
+    assert field["results"][0]["mark"] == "6.42"
+    assert field["results"][0]["combined_points"] == "679"
+    assert len(field["results"][0]["attempts"]) == 3
+    assert combined["event_type"] == "combined"
+    assert combined["results"][0]["mark"] == "1438"
+    assert combined["results"][0]["combined_partial_points"] == {"60m": "759", "Longitud": "679"}
+
+
+def test_fam_parser_parses_multiple_combined_events_same_pdf() -> None:
+    parser = FamResultsParser()
+    pages = [
+        """Campeonato de Madrid de Pruebas Combinadas
+Madrid-Gallur, 17-18 enero 2026
+ACTA DEL CAMPEONATO
+Heptatlón Sub 20 Masc
+60m Sub 20 Masc
+Nombre F de Nac Ptos
+Pto Dor Cat Calle Marca
+Club Lic Acum.
+Serie 1 17/01/2026 15:33
+1 201 Simon Ortega Perez 05/07/2008 JM 5 7.11 844
+Club Corredores M201 844
+Heptatlón Sub 20 Masc
+Nombre F de Nac
+Pto Dor Cat 60 Marca
+Club Lic
+1 201 Simon Ortega Perez 05/07/2008 JM 7.11 844
+Club Corredores M201
+844
+Pentatlón Abs Fem
+60m Vallas (0,84) Abs Fem
+Nombre F de Nac Ptos
+Pto Dor Cat Calle Marca
+Club Lic Acum.
+Serie 1 17/01/2026 15:36
+1 301 Ana Prueba Dos 02/02/2000 SF 4 8.81 950
+Club Dos M301 950
+Altura Abs Fem
+Nombre F de Nac Ptos
+Pto Dor Cat Marca
+Club Lic Acum.
+Grupo 17/01/2026 15:50
+1 301 Ana Prueba Dos 02/02/2000 SF 1.71 867
+Club Dos M301 1.817
+1.65 O/1.68 O/1.71 O/1.74 XXX
+Pentatlón Abs Fem
+Nombre F de Nac
+Pto Dor Cat 60mv Altura Marca
+Club Lic
+1 301 Ana Prueba Dos 02/02/2000 SF 8.81 1.71 1.817
+Club Dos M301
+950 867"""
+    ]
+
+    result = parser.parse(Path("multiple-combined.pdf"), pages)
+
+    combined_events = [event for event in result["events"] if event["event_type"] == "combined"]
+    assert [(event["event_name"], event["category_text"], event["sex"]) for event in combined_events] == [
+        ("Heptatlón", "SUB-20", "M"),
+        ("Pentatlón", "SENIOR/ABSOLUTA", "F"),
+    ]
+    assert combined_events[0]["results"][0]["mark"] == "844"
+    assert combined_events[1]["results"][0]["mark"] == "1817"
+    assert combined_events[1]["results"][0]["combined_partial_points"] == {
+        "60m Vallas (0,84)": "950",
+        "Altura": "867",
+    }
+
+
+def test_fam_parser_keeps_normal_acta_event_without_combined_context() -> None:
+    parser = FamResultsParser()
+    pages = [
+        """Jornada de Menores
+Madrid-Gallur, 11 enero 2026
+ACTA DEL CAMPEONATO
+50m Sub 8 Masc
+Final
+Nombre F de Nac
+Pto Dor Calle Marca
+Club Lic
+Serie 1 11/01/2026 11:10
+1 137 Javier Marijuan Rodriguez 26/02/2019 4 9.23
+CAP Alcobendas M35139"""
+    ]
+
+    result = parser.parse(Path("normal-acta.pdf"), pages)
+
+    event = result["events"][0]
+    assert event.get("combined_event") is None
+    assert event["results"][0]["mark"] == "9.23"
+
+
+def test_combined_total_marks_are_points() -> None:
+    assert parse_mark_numeric("4776").to_eng_string() == "4776"
+    assert infer_mark_unit("Heptatlón", "4776") == "points"
+    assert infer_mark_unit("Pentatlón", "3950") == "points"
+
+
 def test_fam_parser_treats_master_as_category() -> None:
     parser = FamResultsParser()
     pages = [
@@ -706,6 +906,27 @@ M13716
     assert event["event_name"] == "200m"
     assert event["category_text"] == "MASTER"
     assert event["sex"] == "F"
+
+
+def test_fam_parser_ignores_vet_suffix_in_event_name() -> None:
+    parser = FamResultsParser()
+    pages = [
+        """10:00 02/05/2026 300m vallas (0,762) VET 60-69 Máster Masculino Serie 1
+Pto. Dorsal Atleta Lic.
+FN Resultado
+1 458 Jose Garcia Pintado
+Union Atletica Coslada
+M13716
+29/04/1961 48.22"""
+    ]
+
+    result = parser.parse(Path("vet.pdf"), pages)
+
+    event = result["events"][0]
+    assert event["event_name"] == "300m vallas (0,762)"
+    assert event["category_text"] == "MASTER"
+    assert event["sex"] == "M"
+    assert event["results"][0]["mark"] == "48.22"
 
 
 def test_fam_parser_keeps_sub_category_out_of_event_name() -> None:
@@ -924,6 +1145,73 @@ Final B 10/01/2026 20:30
     assert event["relay_members"][1]["relay_group"] == 1
     assert event["relay_members"][2]["athlete_name"] == "Eliam Fernandez Ortiz De Zarate"
     assert event["relay_members"][2]["relay_group"] == 2
+
+
+def test_fam_parser_parses_relay_status_results_without_position() -> None:
+    parser = FamResultsParser()
+    pages = [
+        """Jornada de Menores 46 Rivas-Vaciamadrid
+Rivas-Vaciamadrid, 3 mayo 2026
+ACTA DEL CAMPEONATO
+4x100m Sub 16 Masc
+Final
+Pto Dor Equipo F de Nac Calle Marca
+Relevistas Lic
+Serie 1 03/05/2026 12:17
+1 At. Arroyomolinos 5 47.50
+741 Adrian Gao Ortiz Jimenez 08/06/2011 M12535
+A.D. Sprint 3 NP
+33 Diego Vargas Martinez 27/05/2011 M6134
+A.D. Marathon 4 DS RT 24.7
+70 Juan Torres Alba 14/07/2011 M17369
+Ciudad de Rivas 6 AB
+11 Eliam Fernandez Ortiz De Zarate 14/09/2011 M2222"""
+    ]
+
+    result = parser.parse(Path("relay-status-without-position.pdf"), pages)
+
+    event = result["events"][0]
+    assert event["unparsed_lines"] == []
+    assert [(r["position"], r["club"], r["lane"], r["mark"], r["status"], r["status_original"]) for r in event["results"]] == [
+        (1, "At. Arroyomolinos", 5, "47.50", "OK", None),
+        (None, "A.D. Sprint", 3, None, "NP", "NP"),
+        (None, "A.D. Marathon", 4, None, "DQ", "DS"),
+        (None, "Ciudad de Rivas", 6, None, "DNF", "AB"),
+    ]
+    assert "RT" not in event["results"][2]["raw_text"]
+    assert event["relay_members"][0]["relay_group"] == 1
+    assert event["relay_members"][1]["relay_group"] == 2
+    assert event["relay_members"][2]["relay_group"] == 3
+    assert event["relay_members"][3]["relay_group"] == 4
+
+
+def test_fam_parser_parses_relay_member_without_bib_number() -> None:
+    parser = FamResultsParser()
+    pages = [
+        """Campeonato de Madrid de Relevos
+Madrid-Aluche, 9-10 mayo 2026
+ACTA DEL CAMPEONATO
+4x100m Master Masc
+Final
+Pto Dor Equipo F de Nac Calle Marca
+Relevistas Lic
+Final 10/05/2026 12:17
+Club Corredores 4 NP
+409 Ivan Gomez Acedo 23/11/1980 M346
+Masood Bapiri 22/09/1981 M3970412ATs"""
+    ]
+
+    result = parser.parse(Path("relay-member-without-bib.pdf"), pages)
+
+    event = result["events"][0]
+    assert event["unparsed_lines"] == []
+    assert event["results"][0]["club"] == "Club Corredores"
+    assert event["results"][0]["status"] == "NP"
+    assert event["relay_members"][0]["bib_number"] == "409"
+    assert event["relay_members"][1]["bib_number"] is None
+    assert event["relay_members"][1]["athlete_name"] == "Masood Bapiri"
+    assert event["relay_members"][1]["birth_date"] == "1981-09-22"
+    assert event["relay_members"][1]["license"] == "M3970412ATs"
 
 
 def test_fam_parser_parses_six_acta_relay_results_in_final_b() -> None:
