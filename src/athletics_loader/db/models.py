@@ -16,6 +16,9 @@ class Category(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     code: Mapped[str] = mapped_column(String(50), nullable=False)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
+    min_age: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_age: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    is_master: Mapped[bool] = mapped_column(nullable=False)
 
 
 class EventType(Base):
