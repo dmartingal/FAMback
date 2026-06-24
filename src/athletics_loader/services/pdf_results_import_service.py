@@ -33,7 +33,9 @@ from athletics_loader.utils.text import normalize_name
 
 
 class PdfResultsImportService:
-    def __init__(self) -> None:
+    def __init__(self, only_club_name: str | None = None) -> None:
+        self.only_club_name = only_club_name
+        self.only_club_name_normalized = _db_normalized(only_club_name) if only_club_name else None
         self._missing_event_type_aliases: set[tuple[str, str]] = set()
 
     def import_dir(self, pdf_dir: Path) -> list[dict]:
@@ -94,6 +96,10 @@ class PdfResultsImportService:
         competition = self._get_or_create_competition(db, parsed.get("competition", {}), source)
 
         for event in parsed.get("events", []):
+            results = self._filter_results_by_club(event.get("results", []))
+            if self.only_club_name_normalized and not results:
+                continue
+
             competition_event = self._get_or_create_competition_event(db, competition, source, event)
             summary["events"] += 1
             relay_result_ids_by_group: dict[int, int] = {}
@@ -111,7 +117,7 @@ class PdfResultsImportService:
                 )
                 summary["errors"] += 1
 
-            for result in event.get("results", []):
+            for result in results:
                 for warning in result.get("parse_warnings", []):
                     self._add_event_import_error(
                         db,
@@ -191,11 +197,29 @@ class PdfResultsImportService:
                     db,
                     competition_event,
                     source,
-                    event.get("relay_members", []),
+                    self._filter_relay_members_by_groups(event.get("relay_members", []), relay_result_ids_by_group),
                     relay_result_ids_by_group,
                 )
 
         return summary
+
+    def _filter_results_by_club(self, results: list[dict]) -> list[dict]:
+        if not self.only_club_name_normalized:
+            return results
+        return [result for result in results if self._result_matches_club_filter(result)]
+
+    def _result_matches_club_filter(self, result: dict) -> bool:
+        club_name = result.get("club")
+        return bool(club_name and _db_normalized(club_name) == self.only_club_name_normalized)
+
+    def _filter_relay_members_by_groups(
+        self,
+        members: list[dict],
+        relay_result_ids_by_group: dict[int, int],
+    ) -> list[dict]:
+        if not self.only_club_name_normalized:
+            return members
+        return [member for member in members if member.get("relay_group") in relay_result_ids_by_group]
 
     def _get_or_create_competition(self, db: Session, data: dict, source: SourceFile) -> Competition:
         name = data.get("name") or source.filename

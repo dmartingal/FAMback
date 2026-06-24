@@ -720,6 +720,37 @@ Colmenar Viejo M6134"""
     assert event["results"][0]["lane"] == 6
 
 
+def test_fam_parser_parses_acta_round_with_inline_wind() -> None:
+    parser = FamResultsParser()
+    pages = [
+        """Jornada de Menores 47 y 48 Arganda del Rey
+Arganda del Rey, 9-10 mayo 2026
+ACTA DEL CAMPEONATO
+80m Sub 14 Fem
+Final
+Nombre F de Nac
+Pto Dor Calle Marca
+Club Lic
+Serie 3 09/05/2026 11:39 Viento: -0.6
+1 1297 Sara Sanchez Checa 27/08/2013 2 11.90
+A. A. Moratalaz M3964697ATs
+2 1037 Marina Martin Rodrigues 20/05/2014 3 12.15
+Atletismo Los Angeles Villaverde M30258"""
+    ]
+
+    result = parser.parse(Path("acta-inline-wind.pdf"), pages)
+
+    event = result["events"][0]
+    assert event["event_name"] == "80m"
+    assert event["category_text"] == "SUB-14"
+    assert event["sex"] == "F"
+    assert event["round_name"] == "Serie 3"
+    assert event["wind"] == "-0.6"
+    assert event["results"][1]["athlete"] == "Marina Martin Rodrigues"
+    assert event["results"][1]["club"] == "Atletismo Los Angeles Villaverde"
+    assert event["results"][1]["mark"] == "12.15"
+
+
 def test_fam_parser_ignores_attempt_count_and_points_after_acta_height_mark() -> None:
     parser = FamResultsParser()
     pages = [

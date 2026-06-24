@@ -15,7 +15,7 @@ INLINE_EVENT_HEADER = re.compile(r"^(?P<time>\d{2}:\d{2})\s+(?P<date>\d{2}/\d{2}
 WIND = re.compile(r"^Viento:\s*(?P<wind>[+-]?\d+(?:[.,]\d+)?)$", re.IGNORECASE)
 ACTA_ROUND = re.compile(
     r"^(?P<round>(?:Serie\s+\d+)|(?:Grupo(?:\s+[A-Z0-9]+)?)|(?:Semifinal(?:\s+(?:\d+|[A-Z]))?)|(?:Final(?:\s+[A-Z])?))\s+"
-    r"(?P<date>\d{2}/\d{2}/\d{4})\s+(?P<time>\d{2}:\d{2})$",
+    r"(?P<date>\d{2}/\d{2}/\d{4})\s+(?P<time>\d{2}:\d{2})(?:\s+Viento:\s*(?P<wind>[+-]?\d+(?:[.,]\d+)?))?$",
     re.IGNORECASE,
 )
 SEX = re.compile(r"\b(?P<sex>Femenino|Masculino|Fem|Masc)\b", re.IGNORECASE)
@@ -451,6 +451,7 @@ class FamResultsParser(BasePdfParser):
             )
             event["attempt_headers"] = attempt_headers
             event["event_type"] = event_type
+            event["wind"] = round_match.group("wind")
             event["has_rt_column"] = has_rt_column
             event["has_points_column"] = has_points_column
             if combined_context:

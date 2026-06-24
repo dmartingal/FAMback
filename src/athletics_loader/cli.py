@@ -11,10 +11,13 @@ app = typer.Typer(help='Athletics PDF loader CLI')
 
 
 @app.command('import-pdfs')
-def import_pdfs(pdf_dir: Path = typer.Option(Path(settings.pdf_input_dir), '--pdf-dir')) -> None:
+def import_pdfs(
+    pdf_dir: Path = typer.Option(Path(settings.pdf_input_dir), '--pdf-dir'),
+    only_club: str | None = typer.Option(None, '--only-club', help='Import only results for this club name'),
+) -> None:
     from athletics_loader.services.pdf_results_import_service import PdfResultsImportService
 
-    result = PdfResultsImportService().import_dir(pdf_dir)
+    result = PdfResultsImportService(only_club_name=only_club).import_dir(pdf_dir)
     typer.echo(f'PDFs encontrados: {len(list(pdf_dir.glob("*.pdf")))}')
     typer.echo(f'PDFs procesados/ignorados: {len(result)}')
     for item in result:

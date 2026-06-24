@@ -108,3 +108,34 @@ def test_get_or_create_athlete_warns_on_birth_date_conflict_without_overwriting(
     assert athlete.birth_date == date(2010, 1, 2)
     assert athlete.current_license == "M99999"
     assert [warning[0] for warning in warnings] == ["ATHLETE_BIRTH_DATE_CONFLICT", "ATHLETE_LICENSE_CHANGED"]
+
+
+def test_filter_results_by_club_keeps_only_matching_normalized_club() -> None:
+    service = PdfResultsImportService(only_club_name="Atletismo Los Angeles Villaverde")
+    results = [
+        {"athlete": "A", "club": "Atletismo Los Angeles Villaverde"},
+        {"athlete": "B", "club": "A.D. Marathon"},
+        {"athlete": "C", "club": None},
+    ]
+
+    assert service._filter_results_by_club(results) == [results[0]]
+
+
+def test_filter_results_by_club_without_filter_keeps_all_results() -> None:
+    results = [
+        {"athlete": "A", "club": "Atletismo Los Angeles Villaverde"},
+        {"athlete": "B", "club": "A.D. Marathon"},
+    ]
+
+    assert PdfResultsImportService()._filter_results_by_club(results) == results
+
+
+def test_filter_relay_members_by_groups_keeps_only_imported_relay_groups() -> None:
+    service = PdfResultsImportService(only_club_name="Atletismo Los Angeles Villaverde")
+    members = [
+        {"relay_group": 1, "athlete_name": "A"},
+        {"relay_group": 2, "athlete_name": "B"},
+        {"relay_group": None, "athlete_name": "C"},
+    ]
+
+    assert service._filter_relay_members_by_groups(members, {2: 10}) == [members[1]]
