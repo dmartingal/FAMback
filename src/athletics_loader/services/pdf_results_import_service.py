@@ -1,0 +1,837 @@
+from __future__ import annotations
+
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+import re
+
+from sqlalchemy import delete, func, select
+from sqlalchemy.orm import Session
+
+from athletics_loader.db.models import (
+    Athlete,
+    AthleteClub,
+    AthleteLicense,
+    Category,
+    Club,
+    Competition,
+    CompetitionEvent,
+    EventType,
+    EventTypeAlias,
+    ImportError,
+    RelayResultMember,
+    Result,
+    ResultAttempt,
+    SourceFile,
+)
+from athletics_loader.db.session import SessionLocal
+from athletics_loader.pdf.pdf_reader import extract_text_pages
+from athletics_loader.pdf.parsers.fam_results_parser import FamResultsParser
+from athletics_loader.utils.dates import calculate_age
+from athletics_loader.utils.hashes import sha256_file
+from athletics_loader.utils.marks import infer_mark_unit, parse_mark_numeric
+from athletics_loader.utils.text import normalize_name
+
+
+class PdfResultsImportService:
+    def __init__(self, only_club_name: str | None = None) -> None:
+        self.only_club_name = only_club_name
+        self.only_club_name_normalized = _db_normalized(only_club_name) if only_club_name else None
+        self._missing_event_type_aliases: set[tuple[str, str]] = set()
+
+    def import_dir(self, pdf_dir: Path) -> list[dict]:
+        self._missing_event_type_aliases.clear()
+        parser = FamResultsParser()
+        out = []
+        for pdf_path in sorted(pdf_dir.glob("*.pdf")):
+            file_hash = sha256_file(pdf_path)
+            pages = extract_text_pages(pdf_path)
+            valid = parser.can_parse(pdf_path, pages)
+            parsed = parser.parse(pdf_path, pages) if valid else {"pages": len(pages)}
+
+            with SessionLocal() as db:
+                existing = db.scalar(select(SourceFile).where(SourceFile.file_hash == file_hash))
+                if existing and existing.status == "PROCESSED":
+                    out.append({"filename": pdf_path.name, "hash": file_hash, "status": "SKIPPED"})
+                    continue
+
+                source = existing or SourceFile(
+                    filename=pdf_path.name,
+                    file_path=str(pdf_path),
+                    file_hash=file_hash,
+                    status="PENDING",
+                )
+                source.filename = pdf_path.name
+                source.file_path = str(pdf_path)
+                source.pages_count = len(pages)
+                source.error_message = None
+                db.add(source)
+                db.flush()
+                db.execute(delete(ImportError).where(ImportError.source_file_id == source.id))
+
+                if not valid:
+                    self._add_import_error(db, source, None, None, "UNSUPPORTED_PDF", "No se ha detectado formato FAM soportado")
+                    source.status = "IGNORED"
+                    source.processed_at = datetime.now()
+                    db.commit()
+                    out.append({"filename": pdf_path.name, "hash": file_hash, "status": source.status, "parsed": parsed})
+                    continue
+
+                summary = self._import_parsed(db, source, parsed)
+                source.status = "PROCESSED" if summary["errors"] == 0 else "PARTIAL"
+                source.processed_at = datetime.now()
+                source.error_message = None if summary["errors"] == 0 else f"{summary['errors']} errores de importación"
+                db.commit()
+                out.append(
+                    {
+                        "filename": pdf_path.name,
+                        "hash": file_hash,
+                        "status": source.status,
+                        "summary": summary,
+                    }
+                )
+        return out
+
+    def _import_parsed(self, db: Session, source: SourceFile, parsed: dict) -> dict:
+        summary = {"events": 0, "results": 0, "attempts": 0, "errors": 0, "warnings": 0}
+        competition = self._get_or_create_competition(db, parsed.get("competition", {}), source)
+
+        for event in parsed.get("events", []):
+            results = self._filter_results_by_club(event.get("results", []))
+            if self.only_club_name_normalized and not results:
+                continue
+
+            summary["events"] += 1
+            competition_event_for_errors = None
+            relay_result_ids_by_group: dict[int, int] = {}
+            relay_competition_events_by_group: dict[int, CompetitionEvent] = {}
+
+            for line in event.get("unparsed_lines", []):
+                if competition_event_for_errors is None:
+                    competition_event_for_errors = self._get_or_create_competition_event(db, competition, source, event)
+                self._add_event_import_error(
+                    db,
+                    source,
+                    event,
+                    competition_event_for_errors,
+                    event.get("page_number"),
+                    line,
+                    "UNPARSED_LINE",
+                    "No se ha podido interpretar la línea del bloque de resultados",
+                )
+                summary["errors"] += 1
+
+            for result in results:
+                is_relay_result = event.get("event_type") == "relay"
+                athlete = None
+                athlete_warnings = []
+                missing_athlete_warning = None
+                if not is_relay_result and result.get("athlete"):
+                    athlete, athlete_warnings = self._get_or_create_athlete(db, result, event.get("sex"))
+                elif not is_relay_result:
+                    missing_athlete_warning = (
+                        "ATHLETE_NOT_LINKED",
+                        "El PDF no aporta nombre de atleta; se inserta el resultado sin enlazar atleta",
+                    )
+
+                club = self._get_or_create_club(db, result.get("club"))
+                category_id = self._resolve_result_category_id(db, event, competition, athlete, result)
+                competition_event = self._get_or_create_competition_event(db, competition, source, event, category_id)
+                if is_relay_result and not club:
+                    self._add_event_import_error(
+                        db,
+                        source,
+                        event,
+                        competition_event,
+                        event.get("page_number"),
+                        result.get("raw_text"),
+                        "MISSING_RELAY_CLUB",
+                        "No se inserta el relevo porque el PDF no aporta club/equipo",
+                        result,
+                    )
+                    summary["errors"] += 1
+                    continue
+
+                for warning in result.get("parse_warnings", []):
+                    self._add_event_import_error(
+                        db,
+                        source,
+                        event,
+                        competition_event,
+                        event.get("page_number"),
+                        warning.get("raw_text"),
+                        warning.get("error_type", "PARSE_WARNING"),
+                        warning.get("message", "Aviso durante el parseo de la fila de resultado"),
+                        result,
+                    )
+                    summary["warnings"] += 1
+
+                for warning_type, warning_message in athlete_warnings:
+                    self._add_event_import_error(
+                        db,
+                        source,
+                        event,
+                        competition_event,
+                        event.get("page_number"),
+                        result.get("raw_text"),
+                        warning_type,
+                        warning_message,
+                        result,
+                    )
+                    summary["warnings"] += 1
+
+                if missing_athlete_warning:
+                    warning_type, warning_message = missing_athlete_warning
+                    self._add_event_import_error(
+                        db,
+                        source,
+                        event,
+                        competition_event,
+                        event.get("page_number"),
+                        result.get("raw_text"),
+                        warning_type,
+                        warning_message,
+                        result,
+                    )
+                    summary["warnings"] += 1
+
+                if athlete and result.get("license"):
+                    self._get_or_create_athlete_license(db, athlete, result["license"], source, competition)
+                if athlete and club:
+                    self._get_or_create_athlete_club(db, athlete, club, source, competition)
+
+                db_result = self._get_or_create_result(db, competition_event, athlete, club, source, event, result)
+                if is_relay_result and result.get("relay_group") is not None:
+                    relay_result_ids_by_group[result["relay_group"]] = db_result.id
+                    relay_competition_events_by_group[result["relay_group"]] = competition_event
+                summary["results"] += 1
+                for attempt in result.get("attempts", []):
+                    self._get_or_create_attempt(db, db_result, attempt)
+                    summary["attempts"] += 1
+
+            if event.get("event_type") == "relay":
+                for competition_event in _unique_competition_events(relay_competition_events_by_group.values()):
+                    event_group_ids = {
+                        group
+                        for group, relay_competition_event in relay_competition_events_by_group.items()
+                        if relay_competition_event.id == competition_event.id
+                    }
+                    event_result_ids_by_group = {
+                        group: result_id
+                        for group, result_id in relay_result_ids_by_group.items()
+                        if group in event_group_ids
+                    }
+                    self._replace_relay_members(
+                        db,
+                        competition_event,
+                        source,
+                        self._filter_relay_members_by_groups(event.get("relay_members", []), event_result_ids_by_group),
+                        event_result_ids_by_group,
+                    )
+
+        return summary
+
+    def _filter_results_by_club(self, results: list[dict]) -> list[dict]:
+        if not self.only_club_name_normalized:
+            return results
+        return [result for result in results if self._result_matches_club_filter(result)]
+
+    def _result_matches_club_filter(self, result: dict) -> bool:
+        club_name = result.get("club")
+        return bool(club_name and _db_normalized(club_name) == self.only_club_name_normalized)
+
+    def _filter_relay_members_by_groups(
+        self,
+        members: list[dict],
+        relay_result_ids_by_group: dict[int, int],
+    ) -> list[dict]:
+        if not self.only_club_name_normalized:
+            return members
+        return [member for member in members if member.get("relay_group") in relay_result_ids_by_group]
+
+    def _get_or_create_competition(self, db: Session, data: dict, source: SourceFile) -> Competition:
+        name = data.get("name") or source.filename
+        venue = data.get("venue_original")
+        competition_date = _parse_iso_date(data.get("competition_date")) or date.today()
+        name_normalized = _db_normalized(name)
+        venue_normalized = _db_normalized(venue) if venue else None
+
+        competition = db.scalar(
+            select(Competition).where(
+                Competition.name_normalized == name_normalized,
+                Competition.competition_date == competition_date,
+                Competition.venue_normalized == venue_normalized,
+            )
+        )
+        if not competition:
+            competition = Competition(
+                name=name,
+                name_normalized=name_normalized,
+                venue=venue,
+                venue_normalized=venue_normalized,
+                competition_date=competition_date,
+                source_name=source.filename,
+            )
+            db.add(competition)
+            db.flush()
+        return competition
+
+    def _get_or_create_club(self, db: Session, name: str | None) -> Club | None:
+        if not name:
+            return None
+        if _looks_like_relay_member_club(name):
+            return None
+        normalized = _db_normalized(name)
+        club = db.scalar(select(Club).where(Club.name_normalized == normalized))
+        if not club:
+            club = Club(name=name, name_normalized=normalized)
+            db.add(club)
+            db.flush()
+        return club
+
+    def _get_or_create_athlete(self, db: Session, result: dict, gender: str | None) -> tuple[Athlete, list[tuple[str, str]]]:
+        warnings = []
+        full_name = result["athlete"]
+        full_name_normalized = normalize_name(full_name)
+        athlete = db.scalar(select(Athlete).where(Athlete.full_name_normalized == full_name_normalized))
+        birth_date = _parse_iso_date(result.get("birth_date"))
+        license_code = result.get("license")
+        license_normalized = _db_normalized(license_code) if license_code else None
+        if not athlete:
+            athlete = Athlete(
+                full_name=full_name,
+                full_name_normalized=full_name_normalized,
+                birth_date=birth_date,
+                gender=gender,
+                current_license=license_code,
+                current_license_normalized=license_normalized,
+            )
+            db.add(athlete)
+            db.flush()
+        else:
+            athlete.gender = athlete.gender or gender
+            if birth_date:
+                if athlete.birth_date is None:
+                    athlete.birth_date = birth_date
+                elif athlete.birth_date != birth_date:
+                    warnings.append(
+                        (
+                            "ATHLETE_BIRTH_DATE_CONFLICT",
+                            f"El atleta ya existe con fecha de nacimiento {athlete.birth_date.isoformat()} y el PDF trae {birth_date.isoformat()}; no se sobrescribe",
+                        )
+                    )
+            if license_code:
+                if athlete.current_license_normalized and athlete.current_license_normalized != license_normalized:
+                    warnings.append(
+                        (
+                            "ATHLETE_LICENSE_CHANGED",
+                            f"El atleta ya existe con licencia {athlete.current_license}; se actualiza a {license_code}",
+                        )
+                    )
+                athlete.current_license = license_code
+                athlete.current_license_normalized = license_normalized
+        return athlete, warnings
+
+    def _get_or_create_athlete_license(
+        self,
+        db: Session,
+        athlete: Athlete,
+        license_code: str,
+        source: SourceFile,
+        competition: Competition,
+    ) -> AthleteLicense:
+        normalized = _db_normalized(license_code)
+        athlete_license = db.scalar(
+            select(AthleteLicense).where(
+                AthleteLicense.athlete_id == athlete.id,
+                AthleteLicense.license_normalized == normalized,
+            )
+        )
+        if not athlete_license:
+            athlete_license = AthleteLicense(
+                athlete_id=athlete.id,
+                license=license_code,
+                license_normalized=normalized,
+                source_file_id=source.id,
+                competition_id=competition.id,
+            )
+            db.add(athlete_license)
+            db.flush()
+        return athlete_license
+
+    def _get_or_create_athlete_club(
+        self,
+        db: Session,
+        athlete: Athlete,
+        club: Club,
+        source: SourceFile,
+        competition: Competition,
+    ) -> AthleteClub:
+        athlete_club = db.scalar(
+            select(AthleteClub).where(
+                AthleteClub.athlete_id == athlete.id,
+                AthleteClub.club_id == club.id,
+                AthleteClub.competition_id == competition.id,
+            )
+        )
+        if not athlete_club:
+            athlete_club = AthleteClub(
+                athlete_id=athlete.id,
+                club_id=club.id,
+                competition_id=competition.id,
+                source_file_id=source.id,
+            )
+            db.add(athlete_club)
+            db.flush()
+        return athlete_club
+
+    def _get_or_create_competition_event(
+        self,
+        db: Session,
+        competition: Competition,
+        source: SourceFile,
+        event: dict,
+        category_id: int | None = None,
+    ) -> CompetitionEvent:
+        event_datetime = _parse_datetime(event.get("event_datetime"))
+        if category_id is None:
+            category_id = self._find_category_id(db, event.get("category_text"))
+        event_type_id = self._find_event_type_id(db, event.get("event_name"))
+        wind = _decimal_or_none(event.get("wind"))
+
+        event_query = select(CompetitionEvent).where(
+            CompetitionEvent.competition_id == competition.id,
+            CompetitionEvent.gender == event.get("sex"),
+            CompetitionEvent.round_name == event.get("round_name"),
+            CompetitionEvent.event_datetime == event_datetime,
+            CompetitionEvent.source_file_id == source.id,
+        )
+        if category_id is None:
+            event_query = event_query.where(CompetitionEvent.category_id.is_(None))
+        else:
+            event_query = event_query.where(CompetitionEvent.category_id == category_id)
+        if event_type_id is None:
+            event_query = event_query.where(CompetitionEvent.event_name_original == event.get("event_name"))
+        else:
+            event_query = event_query.where(CompetitionEvent.event_type_id == event_type_id)
+
+        competition_event = db.scalar(event_query)
+        if not competition_event:
+            competition_event = CompetitionEvent(
+                competition_id=competition.id,
+                event_type_id=event_type_id,
+                category_id=category_id,
+                gender=event.get("sex"),
+                event_name_original=event.get("event_name") or event.get("raw_name") or "",
+                category_original=event.get("category_text"),
+                event_datetime=event_datetime,
+                wind=wind,
+                round_type=event.get("round_type"),
+                round_name=event.get("round_name"),
+                source_file_id=source.id,
+                page_number=event.get("page_number"),
+                raw_header_text=event.get("raw_header_text"),
+            )
+            db.add(competition_event)
+            db.flush()
+        elif competition_event.event_type_id is None and event_type_id is not None:
+            competition_event.event_type_id = event_type_id
+        if competition_event.event_name_original != (event.get("event_name") or event.get("raw_name") or ""):
+            competition_event.event_name_original = event.get("event_name") or event.get("raw_name") or ""
+        if competition_event.category_id is None and category_id is not None:
+            competition_event.category_id = category_id
+        if competition_event.category_original is None and event.get("category_text"):
+            competition_event.category_original = event.get("category_text")
+        return competition_event
+
+    def _resolve_result_category_id(
+        self,
+        db: Session,
+        event: dict,
+        competition: Competition,
+        athlete: Athlete | None,
+        result: dict,
+    ) -> int | None:
+        category = result.get("category_text") or event.get("category_text")
+        if not _should_refine_category(category):
+            return self._find_category_id(db, category)
+
+        birth_date = _parse_iso_date(result.get("birth_date")) if result.get("birth_date") else None
+        if birth_date is None and athlete:
+            birth_date = athlete.birth_date
+        if birth_date is None:
+            return self._find_category_id(db, category)
+
+        age_by_competition_year = competition.competition_date.year - birth_date.year
+        age = calculate_age(competition.competition_date, birth_date) if age_by_competition_year >= 35 else age_by_competition_year
+        category = self._find_category_by_age(db, age, master_only=age_by_competition_year >= 35)
+        if category:
+            return category.id
+        return self._find_category_id(db, event.get("category_text"))
+
+    def _find_category_by_age(self, db: Session, age: int, master_only: bool) -> Category | None:
+        query = select(Category).where(
+            Category.min_age <= age,
+            (Category.max_age.is_(None) | (Category.max_age >= age)),
+            Category.code != "MASTER",
+        )
+        if master_only:
+            query = query.where(Category.is_master.is_(True)).order_by(Category.min_age.desc())
+        else:
+            query = query.where(Category.is_master.is_(False)).order_by(Category.min_age.desc())
+        return db.scalar(query)
+
+    def _get_or_create_result(
+        self,
+        db: Session,
+        competition_event: CompetitionEvent,
+        athlete: Athlete | None,
+        club: Club | None,
+        source: SourceFile,
+        event: dict,
+        result: dict,
+    ) -> Result:
+        mark_raw = result.get("mark") or result.get("status_original") or result.get("status")
+        query = select(Result).where(
+            Result.competition_event_id == competition_event.id,
+            Result.mark_raw == mark_raw,
+        )
+        if athlete:
+            query = query.where(Result.athlete_id == athlete.id)
+        else:
+            query = query.where(Result.athlete_id.is_(None))
+            if result.get("dorsal") is None:
+                query = query.where(Result.bib_number.is_(None))
+            else:
+                query = query.where(Result.bib_number == result.get("dorsal"))
+            if club:
+                query = query.where(Result.club_id == club.id)
+        if result.get("position") is None:
+            query = query.where(Result.position.is_(None))
+        else:
+            query = query.where(Result.position == result.get("position"))
+        db_result = db.scalar(query)
+        if not db_result:
+            db_result = Result(
+                competition_event_id=competition_event.id,
+                athlete_id=athlete.id if athlete else None,
+                club_id=club.id if club else None,
+                bib_number=result.get("dorsal"),
+                position=result.get("position"),
+                lane=result.get("lane"),
+                order_number=result.get("order_number"),
+                mark_raw=mark_raw,
+                mark_value_numeric=parse_mark_numeric(result.get("mark")),
+                mark_unit=infer_mark_unit(event.get("event_name"), result.get("mark")),
+                status=result.get("status") or "UNKNOWN",
+                status_original=result.get("status_original"),
+                wind=_decimal_or_none(result.get("wind")),
+                raw_text=result.get("raw_text"),
+                source_file_id=source.id,
+                page_number=event.get("page_number"),
+            )
+            db.add(db_result)
+            db.flush()
+        return db_result
+
+    def _get_or_create_attempt(self, db: Session, result: Result, attempt: dict) -> ResultAttempt:
+        height_or_distance = _decimal_or_none(attempt.get("height_or_distance"))
+        query = select(ResultAttempt).where(
+            ResultAttempt.result_id == result.id,
+            ResultAttempt.attempt_number == attempt.get("attempt_number"),
+        )
+        if height_or_distance is None:
+            query = query.where(ResultAttempt.height_or_distance.is_(None))
+        else:
+            query = query.where(ResultAttempt.height_or_distance == height_or_distance)
+        db_attempt = db.scalar(query)
+        if not db_attempt:
+            db_attempt = ResultAttempt(
+                result_id=result.id,
+                attempt_number=attempt.get("attempt_number"),
+                attempt_value_raw=attempt.get("attempt_value_raw"),
+                attempt_value_numeric=parse_mark_numeric(attempt.get("attempt_value_raw")),
+                attempt_status=attempt.get("attempt_status"),
+                height_or_distance=height_or_distance,
+                raw_text=attempt.get("attempt_value_raw"),
+            )
+            db.add(db_attempt)
+            db.flush()
+        return db_attempt
+
+    def _replace_relay_members(
+        self,
+        db: Session,
+        competition_event: CompetitionEvent,
+        source: SourceFile,
+        members: list[dict],
+        relay_result_ids_by_group: dict[int, int],
+    ) -> None:
+        db.execute(
+            delete(RelayResultMember).where(
+                RelayResultMember.competition_event_id == competition_event.id,
+                RelayResultMember.source_file_id == source.id,
+            )
+        )
+        for member in members:
+            relay_group = member.get("relay_group")
+            db.add(
+                RelayResultMember(
+                    result_id=relay_result_ids_by_group.get(relay_group) if relay_group is not None else None,
+                    competition_event_id=competition_event.id,
+                    source_file_id=source.id,
+                    member_order=member.get("member_order"),
+                    bib_number=member.get("bib_number"),
+                    athlete_name=member.get("athlete_name") or "",
+                    birth_date=_parse_iso_date(member.get("birth_date")),
+                    license=member.get("license"),
+                    raw_text=member.get("raw_text"),
+                )
+            )
+
+    def _find_category_id(self, db: Session, category: str | None) -> int | None:
+        if not category:
+            return None
+        row = db.scalar(select(Category).where(Category.code == category))
+        if not row:
+            row = db.scalar(select(Category).where(Category.name == category))
+        return row.id if row else None
+
+    def _find_event_type_id(self, db: Session, event_name: str | None) -> int | None:
+        if not event_name:
+            return None
+        event_name_normalized = _db_normalized(event_name)
+        lookup_keys = _event_type_lookup_keys(event_name_normalized)
+
+        for lookup_key in lookup_keys:
+            row = db.scalar(select(EventType).where(func.lower(EventType.name_normalized) == lookup_key.lower()))
+            if row:
+                return row.id
+
+        for lookup_key in lookup_keys:
+            alias = db.scalar(select(EventTypeAlias).where(func.lower(EventTypeAlias.alias_normalized) == lookup_key.lower()))
+            if alias:
+                return alias.event_type_id
+
+        self._warn_missing_event_type_alias(event_name, event_name_normalized or "")
+        return None
+
+    def _warn_missing_event_type_alias(self, event_name: str, event_name_normalized: str) -> None:
+        key = (event_name, event_name_normalized)
+        if key in self._missing_event_type_aliases:
+            return
+        self._missing_event_type_aliases.add(key)
+        print(
+            "[WARN] Alias de prueba no encontrado: "
+            f"event_name={event_name!r}, alias_normalized={event_name_normalized!r}. "
+            "Alta este alias en event_type_aliases para rellenar competition_events.event_type_id."
+        )
+
+    def _add_import_error(
+        self,
+        db: Session,
+        source: SourceFile,
+        page_number: int | None,
+        block_text: str | None,
+        error_type: str,
+        error_message: str,
+    ) -> None:
+        db.add(
+            ImportError(
+                source_file_id=source.id,
+                page_number=page_number,
+                block_text=block_text,
+                error_type=error_type,
+                error_message=error_message,
+            )
+        )
+
+    def _add_event_import_error(
+        self,
+        db: Session,
+        source: SourceFile,
+        event: dict,
+        competition_event: CompetitionEvent | None,
+        page_number: int | None,
+        block_text: str | None,
+        error_type: str,
+        error_message: str,
+        result: dict | None = None,
+    ) -> None:
+        self._add_import_error(
+            db,
+            source,
+            page_number,
+            _format_import_error_block(source, event, competition_event, block_text, result),
+            error_type,
+            _format_import_error_message(error_message, event, result),
+        )
+
+
+def _format_import_error_block(
+    source: SourceFile,
+    event: dict,
+    competition_event: CompetitionEvent | None,
+    block_text: str | None,
+    result: dict | None = None,
+) -> str:
+    details = [
+        f"source_file_id: {source.id}",
+        f"filename: {source.filename}",
+        f"competition_event_id: {competition_event.id if competition_event else ''}",
+        f"page_number: {event.get('page_number') or ''}",
+        f"event_name: {event.get('event_name') or event.get('raw_name') or ''}",
+        f"event_type: {event.get('event_type') or ''}",
+        f"round_name: {event.get('round_name') or ''}",
+        f"gender: {event.get('sex') or ''}",
+        f"category: {event.get('category_text') or ''}",
+        f"event_datetime: {event.get('event_datetime') or ''}",
+        f"raw_header_text: {event.get('raw_header_text') or ''}",
+    ]
+    if result:
+        details.extend(
+            [
+                f"athlete: {result.get('athlete') or ''}",
+                f"club: {result.get('club') or ''}",
+                f"bib_number: {result.get('dorsal') or ''}",
+                f"position: {result.get('position') if result.get('position') is not None else ''}",
+                f"mark: {result.get('mark') or result.get('status_original') or result.get('status') or ''}",
+            ]
+        )
+    details.extend(["raw_line:", block_text or ""])
+    return "\n".join(details)
+
+
+def _format_import_error_message(error_message: str, event: dict, result: dict | None = None) -> str:
+    context = [
+        f"event={event.get('event_name') or event.get('raw_name') or ''}",
+        f"round={event.get('round_name') or ''}",
+        f"page={event.get('page_number') or ''}",
+    ]
+    if result:
+        context.extend(
+            [
+                f"athlete={result.get('athlete') or ''}",
+                f"club={result.get('club') or ''}",
+                f"bib={result.get('dorsal') or ''}",
+            ]
+        )
+    return f"{error_message} ({', '.join(context)})"
+
+
+def _db_normalized(value: str | None) -> str | None:
+    return normalize_name(value or "").lower()
+
+
+def _event_type_lookup_keys(event_name_normalized: str | None) -> list[str]:
+    if not event_name_normalized:
+        return []
+    clean_event_name = _strip_trailing_event_type_separator(event_name_normalized)
+    keys = _unique_preserve_order(
+        [
+            event_name_normalized,
+            clean_event_name,
+            _compact_event_type_spacing(clean_event_name),
+            _compact_hurdles_event_name(clean_event_name),
+            _compact_hurdles_event_name(_compact_event_type_spacing(clean_event_name)),
+        ]
+    )
+    for lookup_key in list(keys):
+        if re.fullmatch(r"\d{1,3}(?:\.\d{3})+m", lookup_key):
+            keys.append(lookup_key.replace(".", ""))
+        relay_match = re.fullmatch(r"\d+x\d+m?", lookup_key)
+        if relay_match:
+            if lookup_key.endswith("m"):
+                keys.append(lookup_key[:-1])
+            else:
+                keys.append(f"{lookup_key}m")
+    return _unique_preserve_order(keys)
+
+
+def _strip_trailing_event_type_separator(value: str) -> str:
+    return re.sub(r"\s*[-:|]+\s*$", "", value.strip())
+
+
+def _compact_event_type_spacing(value: str) -> str:
+    compacted = value.strip()
+    compacted = re.sub(r"\s+", " ", compacted)
+    compacted = re.sub(r"\s*\(\s*", "(", compacted)
+    compacted = re.sub(r"\s*\)\s*", ")", compacted)
+    compacted = re.sub(
+        r"\((\d+(?:[.,]\d+)?)\s*(kg|g)\)",
+        lambda match: f"({_decimal_text(match.group(1))}{match.group(2)})",
+        compacted,
+        flags=re.IGNORECASE,
+    )
+    compacted = re.sub(
+        r"\((\d+(?:[.,]\d+)?)\)",
+        lambda match: f"({_decimal_text(match.group(1))})",
+        compacted,
+    )
+    compacted = re.sub(r"\b(\d+(?:[.,]\d+)?)\s*m\b", lambda match: f"{_decimal_text(match.group(1))}m", compacted)
+    return compacted
+
+
+def _compact_hurdles_event_name(value: str) -> str:
+    compacted = _compact_event_type_spacing(value)
+    compacted = re.sub(r"\b(\d+)m\s+vallas\b", r"\1mv", compacted)
+    compacted = re.sub(r"\b(\d+)m\s+v\b", r"\1mv", compacted)
+    return compacted
+
+
+def _decimal_text(value: str) -> str:
+    return value.replace(",", ".")
+
+
+def _unique_preserve_order(values: list[str | None]) -> list[str]:
+    keys = []
+    seen = set()
+    for value in values:
+        if not value or value in seen:
+            continue
+        keys.append(value)
+        seen.add(value)
+    return keys
+
+
+def _looks_like_relay_member_club(name: str) -> bool:
+    return bool(re.match(r"^\d+\s+.+\s+\d{2}/\d{2}/\d{4}$", name.strip()))
+
+
+def _unique_competition_events(events) -> list[CompetitionEvent]:
+    unique = []
+    seen = set()
+    for event in events:
+        if event.id in seen:
+            continue
+        unique.append(event)
+        seen.add(event.id)
+    return unique
+
+
+def _should_refine_category(category: str | None) -> bool:
+    if not category:
+        return True
+    normalized = category.strip().upper().replace("_", "/")
+    return normalized in {"SENIOR/ABSOLUTA", "MASTER"}
+
+
+def _parse_iso_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    return date.fromisoformat(value)
+
+
+def _parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    return datetime.fromisoformat(value)
+
+
+def _decimal_or_none(value: str | int | float | Decimal | None) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value).replace(",", "."))
+    except (InvalidOperation, ValueError):
+        return None
